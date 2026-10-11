@@ -1,0 +1,157 @@
+# Ontology config for method extraction.
+#
+# Single source of truth: the extraction prompt and the JSON output schema are
+# both generated from this file. Changing the ontology = editing this file only.
+# Source: docs/Questions to Concepts to Ontology.xlsx
+#
+# Structure
+#   subject     The thing every claim is about (the method). Not extracted as a concept.
+#   concepts    Things a method relates to. Each concept has:
+#                 id           stable snake_case key, used in output and the Excel sheet
+#                 label        human-readable name, used in the prompt
+#                 definition   shown to the model
+#                 examples     example values, shown to the model as guidance (not a closed list)
+#                 questions    competency questions this concept answers (traceability only)
+#                 relations    one or more relations from the method to this concept.
+#                              Each relation has its own definition so the model can tell
+#                              them apart (e.g. the three Publication relations).
+#                              A relation may carry its own examples.
+#                 enabled      optional, default true; false leaves the concept out of prompt and schema
+#
+# Extracted values are always free text in the paper's own wording. Mapping them to a
+# controlled vocabulary is a separate normalization step, not part of extraction.
+#
+#   Lines marked "OPEN:" are unresolved ontology issues.
+
+version: "0.1"
+
+subject:
+  label: Method
+  definition: >-
+    A structured procedure that supports ethical or sustainability reasoning in ICT,
+    made up of activities that produce outputs.
+  examples: [Value Sensitive Design, Ethical Matrix]
+
+concepts:
+  - id: problem_type
+    label: Problem Type
+    definition: The kind of ethical or sustainability issue the method deals with.
+    examples: [value conflict, environmental impact, social sustainability impact, unintended consequences]
+    questions: [Q1, Q5, Q6, Q15]
+    relations:
+      - name: addresses
+        definition: The method is designed to deal with this kind of issue.
+
+  - id: purpose
+    label: Purpose
+    definition: What the method does with the problem.
+    examples: [identify, evaluate, anticipate, resolve]
+    questions: [Q1, Q5, Q6, Q15, Q20]
+    relations:
+      - name: hasPurpose
+        definition: The method aims to do this with the problem it addresses.
+
+  - id: lifecycle_stage
+    label: Lifecycle stage
+    definition: The phase of an ICT system's life in which the method is applied.
+    examples: [concept (not yet built), requirements, design, deployment, evaluation]
+    questions: [Q2, Q7, Q14]
+    relations:
+      - name: usedIn
+        definition: The method can be applied during this phase of the system's life.
+
+  - id: stakeholder
+    label: Stakeholder
+    definition: A person or group whose values or interests the method takes into account.
+    examples: [patients, clinicians, developers, society]
+    questions: [Q3, Q8]
+    relations:
+      - name: involves
+        definition: The method takes this person's or group's values or interests into account.
+
+  - id: activity
+    label: Activity
+    definition: A step the method prescribes.
+    examples: [stakeholder identification, value elicitation, scenario writing]
+    questions: [Q10]
+    relations:
+      - name: consistsOf
+        definition: The method prescribes this step.
+
+  - id: output
+    label: Output
+    definition: A product that results from the method or one of its activities.
+    examples: [value list, filled-in matrix, scenarios, design requirements]
+    questions: [Q4]
+    relations:
+      - name: produces
+        definition: Carrying out the method (or one of its activities) results in this product.
+
+  - id: input
+    label: Input
+    definition: Information or an artefact the method needs before it can start.
+    examples: [system description, requirements document, technology concept]
+    questions: [Q19]
+    relations:
+      - name: startsWith
+        definition: The method needs this information or artefact before it can start.
+
+  # One concept; the relation names the kind of requirement (replaces the former
+  # Participants, Materials, Expertise and Property/Duration concepts).
+  - id: resource_requirement
+    label: Resource Requirement
+    definition: A requirement needed to complete the method.
+    examples: [participants, expertise, materials, duration]
+    questions: [Q11, Q12, Q13, Q18]
+    relations:
+      - name: requiresParticipants
+        definition: A person or role that takes part in carrying out the method.
+        examples: [facilitator, development team, ethicist, end users]
+      - name: requiresMaterials
+        definition: A tool or artefact used while carrying out the method.
+        examples: [template, canvas, software tool]
+      - name: requiresExpertise
+        definition: Knowledge or skills needed to apply the method.
+        examples: [ethics knowledge, facilitation skills, domain knowledge]
+      - name: hasDuration
+        definition: How long the method (or a session of it) takes to carry out.
+        examples: [two hours, a half-day workshop, several weeks]
+
+  - id: publication
+    label: Publication
+    definition: >-
+      A source that describes, applies, or provides evidence for a method. This can be
+      the paper being processed or a paper it cites. For a cited paper, give the
+      reference as written in the text (e.g. "Friedman et al., 2006"). For the paper
+      being processed, use the value "this publication".
+    examples: [this publication, "Friedman et al., 2006"]
+    questions: [Q9, Q16, Q17]
+    relations:
+      - name: describedIn
+        definition: The publication explains what the method is and how to carry it out.
+      - name: appliedIn
+        definition: The publication reports a concrete ICT study or project in which the method was used.
+      - name: supportedBy
+        definition: The publication provides empirical evidence about the method's effectiveness or usefulness.
+
+  - id: ethical_value
+    label: Ethical Value
+    definition: An ethical value or principle that the method explicitly addresses.
+    examples: [privacy, fairness, autonomy, transparency, accountability]
+    questions: [Q21]
+    relations:
+      - name: addressesValue
+        definition: The method explicitly takes this ethical value or principle into account.
+
+  # Q24 (which publications report the application) is answered by the source
+  # publication recorded on every claim, so it needs no relation of its own.
+  - id: application_case
+    label: Application case
+    definition: A specific ICT project or study in which a method has been applied.
+    examples: [application of VSD in healthcare AI, application of Ethical Matrix in autonomous systems]
+    questions: [Q22, Q23, Q24]
+    relations:
+      - name: appliedInCase
+        definition: >-
+          The method was used in this specific ICT project or study. Describe the
+          system and its application domain (e.g. healthcare, mobility).
