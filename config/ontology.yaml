@@ -32,10 +32,19 @@ subject:
     made up of activities that produce outputs.
   examples: [Value Sensitive Design, Ethical Matrix]
 
+  # Inclusion criteria, source: https://doi.org/10.1016/j.datak.2024.102373
+  criteria:
+    - "C1: It prescribes a specific way of thinking, made up of directions and rules, structured systematically in activities with corresponding products."
+    - "C2: It aids ethical reasoning: the ability to identify, assess and develop ethical arguments from a variety of ethical positions."
+    - "C3: It is aimed at ICT-related situations, or it comes from another discipline but earlier research has shown that it applies to ICT."
+
 concepts:
   - id: problem_type
     label: Problem Type
-    definition: The kind of ethical or sustainability issue the method deals with.
+    definition: >-
+      The kind of ethical or sustainability issue the method deals with. This is a
+      type of issue (such as a conflict between values), not a single value:
+      individual values such as privacy belong under Ethical Value.
     examples: [value conflict, environmental impact, social sustainability impact, unintended consequences]
     questions: [Q1, Q5, Q6, Q15]
     relations:
@@ -44,12 +53,17 @@ concepts:
 
   - id: purpose
     label: Purpose
-    definition: What the method does with the problem.
+    definition: >-
+      What the method does with the problem it addresses, as a verb: for example
+      whether it helps to find issues (identify, surface, anticipate), to judge
+      them (evaluate) or to settle them (resolve). Together with Problem Type it
+      forms a phrase like "identify value conflicts". Not the method's general
+      goal, such as "better design".
     examples: [identify, evaluate, anticipate, resolve]
     questions: [Q1, Q5, Q6, Q15, Q20]
     relations:
       - name: hasPurpose
-        definition: The method aims to do this with the problem it addresses.
+        definition: The method helps to do this with the problem it addresses, e.g. identify value conflicts.
 
   - id: lifecycle_stage
     label: Lifecycle stage

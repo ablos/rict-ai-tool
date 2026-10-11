@@ -76,6 +76,10 @@ class Claim(BaseModel):
     # The quote comes first so the model commits to evidence before writing a value
     quote: str = Field(description="Verbatim text copied from the paper that supports the value.")
     value: str = Field(description="The extracted value, in the paper's own wording.")
+    scope: str = Field(
+        description='"general" if the claim is about the method itself, '
+        "otherwise the name of the application case it comes from."
+    )
     page: int = Field(description="Number of the page the quote is on, from the page markers.")
     section: str | None = Field(description="Heading of the section the quote is in, or null.")
 

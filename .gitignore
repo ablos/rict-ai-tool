@@ -16,3 +16,10 @@ __pycache__/
 
 # Doc files for context
 docs/
+papers/
+
+# Cache
+cache/
+
+# Output
+output/
