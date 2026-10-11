@@ -13,14 +13,14 @@ NOT_REPORTED_VERDICTS = ["correct (not in paper)", "missed (in paper)"]
 REVIEW_COLUMNS = ["verdict", "correction", "notes", "reviewer"]
 
 CLAIM_COLUMNS = [
-    "claim_id", "publication", "method", "relation", "concept", "value", "scope",
+    "claim_id", "publication", "method", "relation", "concept", "value",
     "quote", "page", "section", "context", "quote_found", "match_score", "found_page", "flags",
 ]
 NOT_REPORTED_COLUMNS = ["claim_id", "publication", "method", "relation", "concept"]
 
 # Column widths in characters; columns not listed get DEFAULT_WIDTH.
 WIDTHS = {
-    "publication": 24, "method": 20, "relation": 20, "concept": 18, "value": 30, "scope": 20,
+    "publication": 24, "method": 20, "relation": 20, "concept": 18, "value": 30,
     "quote": 60, "section": 26, "context": 80, "flags": 30, "verdict": 22, "correction": 30, "notes": 30,
 }
 DEFAULT_WIDTH = 12

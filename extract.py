@@ -114,6 +114,6 @@ if __name__ == "__main__":
             if row["status"] == "not_reported":
                 print(f"{row['relation']:<22} (not reported)")
             else:
-                print(f"{row['relation']:<22} {row['value']}  [{row['scope']}, p{row['page']}, {row['section']}]")
+                print(f"{row['relation']:<22} {row['value']}  [p{row['page']}, {row['section']}]")
                 print(f"{'':<22} \"{row['quote']}\"")
         print()

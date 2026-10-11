@@ -23,7 +23,7 @@
 #
 #   Lines marked "OPEN:" are unresolved ontology issues.
 
-version: "0.1"
+version: "0.3"
 
 subject:
   label: Method
@@ -44,7 +44,7 @@ concepts:
     definition: >-
       The kind of ethical or sustainability issue the method deals with. This is a
       type of issue (such as a conflict between values), not a single value:
-      individual values such as privacy belong under Ethical Value.
+      individual values such as privacy belong under Ethical or Sustainability Value.
     examples: [value conflict, environmental impact, social sustainability impact, unintended consequences]
     questions: [Q1, Q5, Q6, Q15]
     relations:
@@ -58,7 +58,9 @@ concepts:
       whether it helps to find issues (identify, surface, anticipate), to judge
       them (evaluate) or to settle them (resolve). Together with Problem Type it
       forms a phrase like "identify value conflicts". Not the method's general
-      goal, such as "better design".
+      goal, such as "better design". The object is the problem the method
+      addresses, not an intermediate step: steps like "identify stakeholders"
+      are Activities.
     examples: [identify, evaluate, anticipate, resolve]
     questions: [Q1, Q5, Q6, Q15, Q20]
     relations:
@@ -85,7 +87,10 @@ concepts:
 
   - id: activity
     label: Activity
-    definition: A step the method prescribes.
+    definition: >-
+      A step the method prescribes: something people do while carrying out the
+      method. Tools, forms, question lists and other artefacts used in a step are
+      materials (Resource Requirement), and what a step results in is an Output.
     examples: [stakeholder identification, value elicitation, scenario writing]
     questions: [Q10]
     relations:
@@ -119,7 +124,10 @@ concepts:
     questions: [Q11, Q12, Q13, Q18]
     relations:
       - name: requiresParticipants
-        definition: A person or role that takes part in carrying out the method.
+        definition: >-
+          A person or role that takes part in carrying out the method, such as a
+          facilitator or interviewees. Not everyone whose values are considered
+          (that is Stakeholder), and not the intended audience of the publication.
         examples: [facilitator, development team, ethicist, end users]
       - name: requiresMaterials
         definition: A tool or artefact used while carrying out the method.
@@ -149,13 +157,18 @@ concepts:
         definition: The publication provides empirical evidence about the method's effectiveness or usefulness.
 
   - id: ethical_value
-    label: Ethical Value
-    definition: An ethical value or principle that the method explicitly addresses.
-    examples: [privacy, fairness, autonomy, transparency, accountability]
+    label: Ethical or Sustainability Value
+    definition: >-
+      An ethical or sustainability value or principle that the method explicitly
+      addresses, including sustainability dimensions: a value the method itself
+      puts forward or works with, not one that only comes up in an example or a
+      single application. Name specific values (such as privacy or environmental
+      sustainability), not general terms like "human values".
+    examples: [privacy, fairness, autonomy, accountability, environmental sustainability, social sustainability]
     questions: [Q21]
     relations:
       - name: addressesValue
-        definition: The method explicitly takes this ethical value or principle into account.
+        definition: The method explicitly takes this ethical or sustainability value or principle into account.
 
   # Q24 (which publications report the application) is answered by the source
   # publication recorded on every claim, so it needs no relation of its own.
@@ -163,7 +176,7 @@ concepts:
     label: Application case
     definition: A specific ICT project or study in which a method has been applied.
     examples: [application of VSD in healthcare AI, application of Ethical Matrix in autonomous systems]
-    questions: [Q22, Q23, Q24]
+    questions: [Q22]  # Q23 (recommendation: future work) and Q24 (covered by Q16) dropped
     relations:
       - name: appliedInCase
         definition: >-
