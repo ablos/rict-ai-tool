@@ -57,6 +57,10 @@ def ocr_pdf(client: Mistral, pdf_path: str | Path) -> dict:
         ],
     }
 
+    # A damaged PDF can come back as empty pages; stop here instead of caching nothing.
+    if not any(page["markdown"].strip() for page in result["pages"]):
+        raise ValueError(f"OCR found no text in {pdf_path.name}; the PDF may be damaged")
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
     return result

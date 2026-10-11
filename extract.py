@@ -10,7 +10,7 @@ from mistralai.extra import response_format_from_pydantic_model
 from pydantic import BaseModel
 from ontology import build_output_model, describe_ontology, relations
 
-EXTRACTION_MODEL = "mistral-large-4"
+EXTRACTION_MODEL = "mistral-large-4-0"
 TEMPERATURE = 0.0
 TOP_P = 1.0 # The API requires 1 when temperature is 0
 RANDOM_SEED = 42
