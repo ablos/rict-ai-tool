@@ -13,22 +13,24 @@ cp .env.example .env               # then put your MISTRAL_API_KEY in .env
 
 ## Papers
 
-- `papers/dev/` — papers for development and testing
-- `papers/heldout/` — papers for the final evaluation only; `run.py` refuses them unless you add `--final`
+Drop the PDFs in one of two folders:
+
+- `papers/dev/` — papers you may learn from: review their errors and improve the prompt or ontology based on them
+- `papers/heldout/` — papers kept out of development, only used to measure the final result; `run.py` refuses them unless you add `--final`
 
 ## Run
 
 Run from the project root:
 
 ```bash
-python run.py papers/dev/paper.pdf --method "Value Sensitive Design"   # method given
-python run.py papers/dev/*.pdf                                       # model screens the papers
-python run.py papers/heldout/*.pdf --final                           # final evaluation only
+python run.py                                                        # every PDF in papers/dev/
+python run.py --final                                                # every PDF in papers/heldout/
+python run.py papers/dev/paper.pdf --method "Value Sensitive Design"   # one paper, method given
 ```
 
 Without `--method`, the model first **screens** each paper: it lists the methods it describes and checks each against the inclusion criteria (C1–C3 in `config/ontology.yaml`). Only methods that meet all criteria are extracted; a paper without one is rejected. With `--method`, screening is skipped.
 
-A paper of ~25 pages takes about 3–4 minutes (OCR is cached, so only the first run per PDF does OCR). `--method` applies to every PDF in the command. `--sample 30` changes how many quotes per paper go into the review sheet (default 20, `0` = all).
+A paper of ~25 pages takes about 3–6 minutes (OCR is cached, so only the first run per PDF does OCR). Each run processes all papers again: a run is one complete, traceable snapshot. `--method` applies to every PDF in the command. `--sample 30` changes how many quotes per paper go into the review sheet (default 20, `0` = all).
 
 Each run creates `runs/<date_time>/`:
 

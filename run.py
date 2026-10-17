@@ -1,7 +1,8 @@
 """Run the whole pipeline on one or more PDFs, and save everything needed to trace the result.
 
+    python run.py                                   # every PDF in papers/dev/
+    python run.py --final                           # every PDF in papers/heldout/ (final evaluation)
     python run.py papers/dev/paper.pdf --method "Value Sensitive Design"
-    python run.py papers/dev/*.pdf                  # the model identifies the methods
     python run.py --rebuild runs/2026-10-11_153000  # redo verify + export, no API calls
 
 Each run gets its own folder under runs/ containing:
@@ -35,13 +36,16 @@ from verify import verify_claims
 ONTOLOGY_PATH = Path("config/ontology.yaml")
 RUNS_DIR = Path("runs")
 HELDOUT_FOLDER = "heldout"  # any PDF inside a folder with this name counts as held out
+DEV_PAPERS = Path("papers/dev")  # processed when no PDFs are given
+HELDOUT_PAPERS = Path("papers/heldout")  # processed when no PDFs are given, with --final
 REVIEW_SAMPLE = 20  # quotes per paper that reviewers judge
 REVIEW_SEED = 1  # fixed, so the same run always gives the same review sample
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("pdfs", nargs="*", type=Path, help="PDF files to process")
+    parser.add_argument("pdfs", nargs="*", type=Path,
+                        help=f"PDF files to process; default: all PDFs in {DEV_PAPERS}/ (or {HELDOUT_PAPERS}/ with --final)")
     parser.add_argument("--method", action="append", default=[],
                         help="method to extract, for every PDF (repeat for several); default: the model identifies them")
     parser.add_argument("--workers", type=int, default=3, help="number of papers processed at the same time")
@@ -59,7 +63,13 @@ def main() -> None:
         return
 
     if not args.pdfs:
-        parser.error("give at least one PDF, or --rebuild RUN_DIR")
+        folder = HELDOUT_PAPERS if args.final else DEV_PAPERS
+        args.pdfs = sorted(folder.glob("*.pdf"))
+
+        if not args.pdfs:
+            sys.exit(f"No PDFs in {folder}/")
+
+        print(f"Processing all {len(args.pdfs)} PDFs in {folder}/")
 
     missing = [pdf for pdf in args.pdfs if not pdf.is_file()]
 
