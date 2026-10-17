@@ -59,6 +59,8 @@ python evaluate.py runs/<date_time>                    # one run
 python evaluate.py runs/<baseline> runs/<improved>     # compare two runs
 ```
 
+It reports agreement twice: with every paper counting equally, and **weighted** by each paper's number of quotes. Every paper gets the same sample size, so the weighted number is the accuracy per quote in the knowledge base (a paper with 9 methods contributes more claims than one with 1); use that one as the headline result.
+
 ## Changing things
 
 - **Ontology** (concepts, definitions, examples, relations): edit `config/ontology.yaml` and raise its `version`. Prompt and schema update automatically. `enabled: false` switches a concept off.

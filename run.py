@@ -272,6 +272,12 @@ def rebuild(run_dir: Path, sample: int | None, seed: int | None) -> None:
 
     meta["review"] = review
     rows = read_jsonl(run_dir / "extracted.jsonl")
+    # Use each paper's file name from meta.json (older runs could store a stale name for a renamed PDF).
+    names = {paper["sha256"]: Path(paper["pdf"]).name for paper in meta["papers"] if paper["sha256"]}
+
+    for row in rows:
+        row["publication"] = names.get(row["pdf_sha256"], row["publication"])
+
     # Restore the paper order of the original run (threads may have saved them in another order).
     paper_order = [paper["sha256"] for paper in meta["papers"]]
     rows.sort(key=lambda row: (paper_order.index(row["pdf_sha256"]) if row["pdf_sha256"] in paper_order else 0,

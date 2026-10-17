@@ -19,12 +19,18 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from export import NO_RELATION
+from export import NO_RELATION, read_jsonl, review_items
 
 
 def score_run(run_dir: Path) -> dict:
     """Agreement between reviewers and LLM for all review workbooks in a run folder."""
     totals, per_relation, per_paper, warnings = Counter(), defaultdict(Counter), {}, []
+    # How many quotes each paper has in total (the pool its sample was drawn from), for weighting.
+    rows = read_jsonl(run_dir / "claims.jsonl")
+    quotes_per_paper = {
+        f"review_{Path(publication).stem}.xlsx": len(review_items([row for row in rows if row["publication"] == publication]))
+        for publication in dict.fromkeys(row["publication"] for row in rows)
+    }
 
     for path in sorted(run_dir.glob("review_*.xlsx")):
         workbook = load_workbook(path)
@@ -57,11 +63,15 @@ def score_run(run_dir: Path) -> dict:
                             f"{paper['value_not_compared']} values not compared yet")
 
         per_paper[path.name] = _with_rates(paper)
+        per_paper[path.name]["quotes_in_paper"] = quotes_per_paper.get(path.name, 0)
         totals += paper
+
+    total = _with_rates(totals)
+    total["weighted"] = {key: _weighted(per_paper, key) for key in ("same_relation", "same_relation_and_value")}
 
     return {
         "run": str(run_dir),
-        "total": _with_rates(totals),
+        "total": total,
         "per_paper": per_paper,
         "per_relation": {relation: _with_rates(counts) for relation, counts in per_relation.items()},
         "screening": score_screening(run_dir / "screening.xlsx", warnings),
@@ -134,6 +144,33 @@ def _with_rates(counts: Counter) -> dict:
     return result
 
 
+def _weighted(per_paper: dict, key: str, z: float = 1.96) -> dict | None:
+    """Agreement rate per quote in the whole run: each paper counts in proportion to its
+    number of quotes, not equally (stratified estimate, one stratum per paper).
+
+    The margin uses the stratified-sampling variance with a finite population correction,
+    since a sample of 20 can be a large share of a small paper.
+    """
+    papers = [paper for paper in per_paper.values() if paper.get("judged") and paper.get("quotes_in_paper")]
+    total_quotes = sum(paper["quotes_in_paper"] for paper in papers)
+
+    if not total_quotes:
+        return None
+
+    rate, variance = 0.0, 0.0
+
+    for paper in papers:
+        weight = paper["quotes_in_paper"] / total_quotes
+        n, size = paper["judged"], paper["quotes_in_paper"]
+        p = paper.get(key, 0) / n
+        rate += weight * p
+        correction = (size - n) / (size - 1) if size > 1 else 0.0
+        variance += weight ** 2 * p * (1 - p) / n * correction
+
+    margin = z * math.sqrt(variance)
+    return {"rate": round(rate, 3), "low": round(max(0.0, rate - margin), 3), "high": round(min(1.0, rate + margin), 3)}
+
+
 def _wilson(successes: int, n: int, z: float = 1.96) -> dict | None:
     if n == 0:
         return None
@@ -166,9 +203,17 @@ def print_scores(scores: list[dict]) -> None:
                        ("human_none", "Reviewer: quote supports nothing")]:
         print(f"{label:<{width}}" + "".join(f"{s['total'].get(key, 0):>{column}}" for s in scores))
 
+    print("\nEvery paper counts equally:")
+
     for key, label in [("same_relation_rate", "Same relation (95% CI)"),
                        ("same_relation_and_value_rate", "Same relation and value (95% CI)")]:
-        print(f"{label:<{width}}" + "".join(f"{_rate(s['total'].get(key)):>{column}}" for s in scores))
+        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total'].get(key)):>{column}}" for s in scores))
+
+    print("Weighted by each paper's number of quotes (accuracy per quote in the knowledge base):")
+
+    for key, label in [("same_relation", "Same relation (95% CI)"),
+                       ("same_relation_and_value", "Same relation and value (95% CI)")]:
+        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total']['weighted'].get(key)):>{column}}" for s in scores))
 
     print(f"\nPer relation chosen by the LLM: same relation and value (quotes judged)")
     relations = dict.fromkeys(relation for s in scores for relation in s["per_relation"])

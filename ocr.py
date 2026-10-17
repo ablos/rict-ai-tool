@@ -29,7 +29,10 @@ def ocr_pdf(client: Mistral, pdf_path: str | Path) -> dict:
     cache_file = CACHE_DIR / f"{sha256}.json"
     
     if cache_file.exists():
-        return json.loads(cache_file.read_text(encoding='utf-8'))
+        result = json.loads(cache_file.read_text(encoding='utf-8'))
+        # The cache is keyed by content, so a renamed PDF is a cache hit: use its current name.
+        result["pdf"] = pdf_path.name
+        return result
 
     encoded = base64.b64encode(pdf_path.read_bytes()).decode('ascii')
     response = client.ocr.process(
