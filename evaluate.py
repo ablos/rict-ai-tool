@@ -70,31 +70,57 @@ def score_run(run_dir: Path) -> dict:
 
 
 def score_screening(path: Path, warnings: list[str]) -> dict | None:
-    """Agreement on include/exclude per paper, from screening.xlsx if the run has one."""
+    """Include/exclude agreement from screening.xlsx (if the run has one), per method and per paper.
+
+    Rows the reviewer added on the Judge sheet are methods the LLM did not find:
+    marked "include", they count as missed by the LLM.
+    """
     if not path.exists():
         return None
 
     workbook = load_workbook(path)
-    llm = {row["paper"]: row["llm_decision"] for row in _rows(workbook["Compare"])}
-    counts = Counter()
+    llm = {(row["paper"], row["method"]): row["llm_decision"] for row in _rows(workbook["Compare"])}
+    methods = Counter()
+    papers = defaultdict(lambda: {"human": False, "llm": False, "judged": False})
+
+    for (paper, _), decision in llm.items():
+        papers[paper]["llm"] |= decision == "include"
 
     for row in _rows(workbook["Judge"]):
         human = (row["human_decision"] or "").strip()
+        key = (row["paper"], row["method"])
 
         if not human:
-            counts["not_judged"] += 1
+            methods["not_judged"] += 1
             continue
 
-        counts["judged"] += 1
-        counts["same_decision"] += human == llm[row["paper"]]
-        counts[f"llm_{llm[row['paper']]}_human_{human}"] += 1
+        papers[row["paper"]]["judged"] = True
+        papers[row["paper"]]["human"] |= human == "include"
 
-    if counts["not_judged"]:
-        warnings.append(f"screening.xlsx: {counts['not_judged']} papers not judged")
+        if key not in llm:  # added by the reviewer
+            methods["missed_by_llm"] += human == "include"
+            continue
 
-    result = dict(counts)
-    result["same_decision_rate"] = _wilson(counts["same_decision"], counts["judged"])
-    return result
+        methods["judged"] += 1
+        methods["same_decision"] += human == llm[key]
+        methods[f"llm_{llm[key]}_human_{human}"] += 1
+
+    if methods["not_judged"]:
+        warnings.append(f"screening.xlsx: {methods['not_judged']} methods not judged")
+
+    paper_counts = Counter()
+
+    for paper in papers.values():
+        if paper["judged"]:
+            paper_counts["judged"] += 1
+            paper_counts["same_decision"] += paper["human"] == paper["llm"]
+            paper_counts[f"llm_{'include' if paper['llm'] else 'exclude'}_human_{'include' if paper['human'] else 'exclude'}"] += 1
+
+    methods = dict(methods)
+    methods["same_decision_rate"] = _wilson(methods.get("same_decision", 0), methods.get("judged", 0))
+    paper_counts = dict(paper_counts)
+    paper_counts["same_decision_rate"] = _wilson(paper_counts.get("same_decision", 0), paper_counts.get("judged", 0))
+    return {"per_method": methods, "per_paper": paper_counts}
 
 
 def _with_rates(counts: Counter) -> dict:
@@ -158,16 +184,18 @@ def print_scores(scores: list[dict]) -> None:
         print(f"  {relation:<{width - 2}}" + "".join(f"{cell:>{column}}" for cell in cells))
 
     if any(s["screening"] for s in scores):
-        print("\nScreening (include / exclude per paper)")
+        for level, title, extra in [("per_method", "Screening per method", [("missed_by_llm", "Missed by the LLM (added by reviewer)")]),
+                                    ("per_paper", "Screening per paper (included if at least one method is)", [])]:
+            print(f"\n{title}")
 
-        for key, label in [("judged", "Papers judged"),
-                           ("llm_include_human_exclude", "LLM included, reviewer excluded"),
-                           ("llm_exclude_human_include", "LLM excluded, reviewer included")]:
-            print(f"  {label:<{width - 2}}" + "".join(
-                f"{(s['screening'] or {}).get(key, 0) if s['screening'] else '-':>{column}}" for s in scores))
+            for key, label in [("judged", "Judged"),
+                               ("llm_include_human_exclude", "LLM included, reviewer excluded"),
+                               ("llm_exclude_human_include", "LLM excluded, reviewer included")] + extra:
+                print(f"  {label:<{width - 2}}" + "".join(
+                    f"{s['screening'][level].get(key, 0) if s['screening'] else '-':>{column}}" for s in scores))
 
-        print(f"  {'Same decision (95% CI)':<{width - 2}}" + "".join(
-            f"{_rate(s['screening']['same_decision_rate']) if s['screening'] else '-':>{column}}" for s in scores))
+            print(f"  {'Same decision (95% CI)':<{width - 2}}" + "".join(
+                f"{_rate(s['screening'][level]['same_decision_rate']) if s['screening'] else '-':>{column}}" for s in scores))
 
     for s in scores:
         for warning in s["warnings"]:

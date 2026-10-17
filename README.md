@@ -30,7 +30,7 @@ python run.py papers/dev/paper.pdf --method "Value Sensitive Design"   # one pap
 
 Without `--method`, the model first **screens** each paper: it lists the methods it describes and checks each against the inclusion criteria (C1–C3 in `config/ontology.yaml`). Only methods that meet all criteria are extracted; a paper without one is rejected. With `--method`, screening is skipped.
 
-A paper of ~25 pages takes about 3–6 minutes (OCR is cached, so only the first run per PDF does OCR). Each run processes all papers again: a run is one complete, traceable snapshot. `--method` applies to every PDF in the command. `--sample 30` changes how many quotes per paper go into the review sheet (default 20, `0` = all).
+A paper of ~25 pages takes about 3–6 minutes (OCR is cached, so only the first run per PDF does OCR). Each run processes all papers again: a run is one complete, traceable snapshot. Temporary API errors are retried automatically. If a paper still fails (`failed_papers` in the summary), redo just those papers inside the same run with `python run.py --retry-failed runs/<date_time>`; this only works if the ontology, prompts and settings haven't changed since. `--method` applies to every PDF in the command. `--sample 30` changes how many quotes per paper go into the review sheet (default 20, `0` = all).
 
 Each run creates `runs/<date_time>/`:
 
@@ -46,11 +46,11 @@ Each run creates `runs/<date_time>/`:
 
 Each workbook holds a random sample of quotes the pipeline found, spread over the relations. Don't look at the Compare and Summary tabs until you have judged every quote: they show the LLM's interpretation.
 
-1. **Judge** — for each quote, read `quote` and `context` (both straight from the paper), then pick the `human_relation` it supports (dropdown; `none` if it supports nothing) and write the `human_value` in a few words. Fill in `reviewer`. The **Relations** tab has the definitions.
+1. **Judge** — for each quote, read `quote` and `context` (both straight from the paper), then pick the `human_relation` it supports for the method in the `method` column (dropdown; `none` if it supports nothing about that method, e.g. when it is about another method in the same paper) and write the `human_value` in a few words. Fill in `reviewer`. The **Relations** tab has the definitions.
 2. Only when all quotes are judged, open **Compare**. It shows your decision next to the LLM's; `relation_match` fills in by itself. Set `value_match` to `yes`, `partly` or `no` for each row.
 3. **Summary** shows the agreement for this paper.
 
-**Screening** (`screening.xlsx`, same idea): on the **Judge** tab, decide per paper `include` or `exclude` — does it describe a method that meets all criteria? — and which method. Then open **Compare** for the LLM's decision and its reason per criterion.
+**Screening** (`screening.xlsx`, same idea): the **Judge** tab has one row per method the LLM found (or `(no method found)`). Decide per method `include` or `exclude`: does it meet all criteria? If the paper describes a method that isn't listed, add a row at the bottom with the paper, the method and `include`; it counts as missed by the LLM. Then open **Compare** for the LLM's decision and its reason per criterion.
 
 When all papers of a run are reviewed, add them up (with 95% confidence intervals):
 

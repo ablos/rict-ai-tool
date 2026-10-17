@@ -4,6 +4,7 @@ The prompt wording lives in prompts/*.md and the ontology in config/ontology.yam
 this file only fills them in, calls the model, and flattens the answer into rows.
 """
 
+from functools import cache
 from pathlib import Path
 from mistralai.client import Mistral
 from mistralai.extra import response_format_from_pydantic_model
@@ -22,6 +23,7 @@ def paper_text(ocr: dict) -> str:
     """All OCR pages as one text, with a marker before each page so the model can cite pages."""
     return "\n\n".join(f"=== PAGE {page['page']} ===\n{page['markdown']}" for page in ocr["pages"])
 
+@cache  # read once per run: editing a prompt during a run does not change that run
 def load_prompt(name: str) -> str:
     return (PROMPT_DIR / f"{name}.md").read_text(encoding="utf-8")
 

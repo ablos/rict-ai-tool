@@ -4,6 +4,7 @@
     python run.py --final                           # every PDF in papers/heldout/ (final evaluation)
     python run.py papers/dev/paper.pdf --method "Value Sensitive Design"
     python run.py --rebuild runs/2026-10-11_153000  # redo verify + export, no API calls
+    python run.py --retry-failed runs/2026-10-11_153000  # redo only the papers that failed
 
 Each run gets its own folder under runs/ containing:
     meta.json        what was run: inputs, ontology, prompts, models, settings, timings
@@ -13,6 +14,7 @@ Each run gets its own folder under runs/ containing:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -26,10 +28,11 @@ from threading import Lock
 
 from dotenv import load_dotenv
 from mistralai.client import Mistral
+from mistralai.client.utils import BackoffStrategy, RetryConfig
 
 import extract
 from export import read_jsonl, write_jsonl, write_review_sheet, write_screening_sheet
-from ocr import CACHE_DIR, OCR_MODEL, file_sha256, ocr_pdf
+from ocr import CACHE_DIR, OCR_MODEL, ocr_pdf
 from ontology import load_ontology
 from verify import verify_claims
 
@@ -40,6 +43,10 @@ DEV_PAPERS = Path("papers/dev")  # processed when no PDFs are given
 HELDOUT_PAPERS = Path("papers/heldout")  # processed when no PDFs are given, with --final
 REVIEW_SAMPLE = 20  # quotes per paper that reviewers judge
 REVIEW_SEED = 1  # fixed, so the same run always gives the same review sample
+# The SDK does not retry by default, so one rate limit (429), server error (5xx), dropped
+# connection or timeout would fail a whole paper. Retry with growing waits (2 s up to
+# 1 min) for at most 45 minutes per call, which leaves room for one retry after a timeout.
+RETRIES = RetryConfig("backoff", BackoffStrategy(2_000, 60_000, 2.0, 45 * 60_000), retry_connection_errors=True)
 
 
 def main() -> None:
@@ -52,6 +59,8 @@ def main() -> None:
     parser.add_argument("--final", action="store_true", help="allow held-out papers (final evaluation only)")
     parser.add_argument("--rebuild", type=Path, metavar="RUN_DIR",
                         help="verify and export an earlier run again from its extracted.jsonl, without API calls")
+    parser.add_argument("--retry-failed", type=Path, metavar="RUN_DIR",
+                        help="process the papers that failed in an earlier run again, into that same run")
     parser.add_argument("--sample", type=int, default=None,
                         help=f"quotes per paper in the review sheet (default {REVIEW_SAMPLE}, 0 = all)")
     parser.add_argument("--seed", type=int, default=None,
@@ -60,6 +69,10 @@ def main() -> None:
 
     if args.rebuild:
         rebuild(args.rebuild, args.sample, args.seed)
+        return
+
+    if args.retry_failed:
+        retry_failed(args.retry_failed, args.workers)
         return
 
     if not args.pdfs:
@@ -92,7 +105,7 @@ def check_heldout(pdfs: list[Path], final: bool) -> None:
 
 def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review: dict) -> None:
     load_dotenv()
-    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"], retry_config=RETRIES)
     ontology = load_ontology(ONTOLOGY_PATH)
 
     run_dir = RUNS_DIR / datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -103,16 +116,7 @@ def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review:
         "command": " ".join(sys.argv),
         "final_evaluation": final,
         "git_commit": git_commit(),
-        "ontology": {"path": str(ONTOLOGY_PATH), "version": ontology["version"], "sha256": ontology["hash"]},
-        "prompts": {name: file_sha256(extract.PROMPT_DIR / f"{name}.md")[:12] for name in ("identify", "extract")},
-        "extraction": {
-            "model": extract.EXTRACTION_MODEL,
-            "temperature": extract.TEMPERATURE,
-            "top_p": extract.TOP_P,
-            "random_seed": extract.RANDOM_SEED,
-            "reasoning_effort": extract.REASONING_EFFORT,
-        },
-        "ocr_model": OCR_MODEL,
+        **settings(ontology),
         "mistralai_version": version("mistralai"),
         "methods_given": methods,
         "review": review,
@@ -132,6 +136,70 @@ def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review:
     meta["papers"] = [paper for paper, _ in results]
     rows = [row for _, paper_rows in results for row in paper_rows]
     finish(run_dir, rows, meta, ontology)
+
+
+def settings(ontology: dict) -> dict:
+    """Everything that determines the extraction results. Recorded in meta.json, and it
+    must not change within a run, so the papers of one run are comparable."""
+    return {
+        "ontology": {"path": str(ONTOLOGY_PATH), "version": ontology["version"], "sha256": ontology["hash"]},
+        # Hash of the prompt text the run actually uses (loaded once, see extract.load_prompt).
+        "prompts": {name: hashlib.sha256(extract.load_prompt(name).encode("utf-8")).hexdigest()[:12]
+                    for name in ("identify", "extract")},
+        "extraction": {
+            "model": extract.EXTRACTION_MODEL,
+            "temperature": extract.TEMPERATURE,
+            "top_p": extract.TOP_P,
+            "random_seed": extract.RANDOM_SEED,
+            "reasoning_effort": extract.REASONING_EFFORT,
+        },
+        "ocr_model": OCR_MODEL,
+    }
+
+
+def retry_failed(run_dir: Path, workers: int) -> None:
+    """Process the papers that failed in an earlier run again, into the same run folder."""
+    meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    failed = [index for index, paper in enumerate(meta["papers"]) if paper["error"]]
+
+    if not failed:
+        sys.exit(f"No failed papers in {run_dir}")
+
+    ontology = load_ontology(ONTOLOGY_PATH)
+    # Same settings as the original run, otherwise one run would mix two versions.
+    changed = [key for key, value in settings(ontology).items() if meta.get(key) != value]
+
+    if changed:
+        sys.exit(f"Settings changed since this run ({', '.join(changed)}). "
+                 "Start a new run instead, or undo the changes.")
+
+    # Drop the claims these papers saved before they failed; they are extracted again.
+    failed_shas = {meta["papers"][index]["sha256"] for index in failed} - {None}
+    raw_file = run_dir / "extracted.jsonl"
+    write_jsonl([row for row in read_jsonl(raw_file) if row["pdf_sha256"] not in failed_shas], raw_file)
+
+    load_dotenv()
+    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"], retry_config=RETRIES)
+    lock = Lock()
+    print(f"Retrying {len(failed)} failed papers in {run_dir}\n")
+
+    def process(index: int) -> tuple[dict, list[dict]]:
+        pdf = Path(meta["papers"][index]["pdf"])
+        return process_paper(client, pdf, meta["methods_given"], ontology, raw_file, lock)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(process, failed))
+
+    for index, (paper, _) in zip(failed, results):
+        meta["papers"][index] = paper
+
+    meta.setdefault("retried", []).append({
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "git_commit": git_commit(),
+        "papers": [meta["papers"][index]["pdf"] for index in failed],
+    })
+    save_meta(run_dir, meta)
+    rebuild(run_dir, None, None)  # verify and export the whole run again, now with these papers
 
 
 def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict,
