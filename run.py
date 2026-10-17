@@ -8,7 +8,7 @@ Each run gets its own folder under runs/ containing:
     meta.json        what was run: inputs, ontology, prompts, models, settings, timings
     extracted.jsonl  the model's raw claims, saved as soon as each method is done
     claims.jsonl     the claims after verification (input for the knowledge graph)
-    review.xlsx      the sheet for human review
+    review_<paper>.xlsx  one workbook per paper for human review (see export.py)
 """
 
 import argparse
@@ -35,6 +35,8 @@ from verify import verify_claims
 ONTOLOGY_PATH = Path("config/ontology.yaml")
 RUNS_DIR = Path("runs")
 HELDOUT_FOLDER = "heldout"  # any PDF inside a folder with this name counts as held out
+REVIEW_SAMPLE = 20  # quotes per paper that reviewers judge
+REVIEW_SEED = 1  # fixed, so the same run always gives the same review sample
 
 
 def main() -> None:
@@ -46,10 +48,14 @@ def main() -> None:
     parser.add_argument("--final", action="store_true", help="allow held-out papers (final evaluation only)")
     parser.add_argument("--rebuild", type=Path, metavar="RUN_DIR",
                         help="verify and export an earlier run again from its extracted.jsonl, without API calls")
+    parser.add_argument("--sample", type=int, default=None,
+                        help=f"quotes per paper in the review sheet (default {REVIEW_SAMPLE}, 0 = all)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help=f"random seed for picking the review sample (default {REVIEW_SEED})")
     args = parser.parse_args()
 
     if args.rebuild:
-        rebuild(args.rebuild)
+        rebuild(args.rebuild, args.sample, args.seed)
         return
 
     if not args.pdfs:
@@ -61,7 +67,9 @@ def main() -> None:
         sys.exit("Not found: " + ", ".join(map(str, missing)))
 
     check_heldout(args.pdfs, args.final)
-    run(args.pdfs, args.method, args.workers, args.final)
+    review = {"sample_per_paper": REVIEW_SAMPLE if args.sample is None else args.sample,
+              "seed": REVIEW_SEED if args.seed is None else args.seed}
+    run(args.pdfs, args.method, args.workers, args.final, review)
 
 
 def check_heldout(pdfs: list[Path], final: bool) -> None:
@@ -72,7 +80,7 @@ def check_heldout(pdfs: list[Path], final: bool) -> None:
         sys.exit("Refusing to run on held-out papers without --final:\n" + "\n".join(f"  {pdf}" for pdf in heldout))
 
 
-def run(pdfs: list[Path], methods: list[str], workers: int, final: bool) -> None:
+def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review: dict) -> None:
     load_dotenv()
     client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
     ontology = load_ontology(ONTOLOGY_PATH)
@@ -97,6 +105,7 @@ def run(pdfs: list[Path], methods: list[str], workers: int, final: bool) -> None
         "ocr_model": OCR_MODEL,
         "mistralai_version": version("mistralai"),
         "methods_given": methods,
+        "review": review,
         "papers": [],
     }
     save_meta(run_dir, meta)  # saved now too, so even a crashed run leaves a trace
@@ -112,7 +121,7 @@ def run(pdfs: list[Path], methods: list[str], workers: int, final: bool) -> None
 
     meta["papers"] = [paper for paper, _ in results]
     rows = [row for _, paper_rows in results for row in paper_rows]
-    finish(run_dir, rows, meta)
+    finish(run_dir, rows, meta, ontology)
 
 
 def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict,
@@ -161,9 +170,19 @@ def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict
     return paper, rows
 
 
-def rebuild(run_dir: Path) -> None:
-    """Verify and export an earlier run again, e.g. after changing verify.py or export.py."""
+def rebuild(run_dir: Path, sample: int | None, seed: int | None) -> None:
+    """Verify and export an earlier run again, e.g. after changing verify.py or export.py.
+    The review sample is drawn the same way as before unless --sample or --seed is given."""
     meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    review = meta.get("review", {"sample_per_paper": REVIEW_SAMPLE, "seed": REVIEW_SEED})
+
+    if sample is not None:
+        review["sample_per_paper"] = sample
+
+    if seed is not None:
+        review["seed"] = seed
+
+    meta["review"] = review
     rows = read_jsonl(run_dir / "extracted.jsonl")
     # Restore the paper order of the original run (threads may have saved them in another order).
     paper_order = [paper["sha256"] for paper in meta["papers"]]
@@ -175,11 +194,11 @@ def rebuild(run_dir: Path) -> None:
         verify_claims([row for row in rows if row["pdf_sha256"] == sha256], ocr)
     
     meta.setdefault("rebuilt", []).append(datetime.now().isoformat(timespec="seconds"))
-    finish(run_dir, rows, meta)
+    finish(run_dir, rows, meta, load_ontology(ONTOLOGY_PATH))
 
 
-def finish(run_dir: Path, rows: list[dict], meta: dict) -> None:
-    """Write claims.jsonl, review.xlsx and meta.json, and print a summary."""
+def finish(run_dir: Path, rows: list[dict], meta: dict, ontology: dict) -> None:
+    """Write claims.jsonl, one review_<paper>.xlsx per paper and meta.json, and print a summary."""
     reported = [row for row in rows if row["status"] == "reported"]
     meta["summary"] = {
         "claims": len(reported),
@@ -190,15 +209,27 @@ def finish(run_dir: Path, rows: list[dict], meta: dict) -> None:
     }
     meta["finished"] = datetime.now().isoformat(timespec="seconds")
     write_jsonl(rows, run_dir / "claims.jsonl")
-    write_review_sheet(rows, run_dir / "review.xlsx", meta)
+
+    # One workbook per paper, so each reviewer gets their own file.
+    review_files = []
+
+    for publication in dict.fromkeys(row["publication"] for row in rows):
+        path = run_dir / f"review_{Path(publication).stem}.xlsx"
+        write_review_sheet([row for row in rows if row["publication"] == publication], path, ontology,
+                           meta["review"]["sample_per_paper"], meta["review"]["seed"], meta)
+        review_files.append(path)
+
     save_meta(run_dir, meta)
 
     print("\nSummary:")
-    
+
     for key, value in meta["summary"].items():
         print(f"  {key}: {value}")
-    
-    print(f"\nReview sheet: {run_dir / 'review.xlsx'}")
+
+    print("\nReview sheets:")
+
+    for path in review_files:
+        print(f"  {path}")
 
 
 def save_meta(run_dir: Path, meta: dict) -> None:

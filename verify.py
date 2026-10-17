@@ -13,6 +13,8 @@ from rapidfuzz import fuzz
 MATCH_THRESHOLD = 90  # minimum fuzzy score (0-100) to count a quote as found
 SHORT_QUOTE_WORDS = 8  # shorter quotes prove little, so they get flagged
 CONTEXT_SENTENCES = 1  # sentences of context on each side of the quote
+MAX_GAP = 500  # most characters a "..." in a quote may leave out
+ELLIPSIS = re.compile(r"\.\.\.|…")
 
 # Characters that can differ between the model's copy and the OCR text.
 REPLACE = {"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-", " ": " "}
@@ -83,26 +85,46 @@ class SourceText:
         return self.heading_titles[index] if index >= 0 else None
 
     def find(self, quote: str, page: int) -> tuple[float, int, int] | None:
-        """Score and (start, end) of the quote in the original text, or None if not found."""
-        needle = normalize(quote)[0].strip()
+        """Score and (start, end) of the quote in the original text, or None if not found.
 
-        if not needle:
+        A quote shortened with "..." is matched piece by piece: the pieces must appear
+        in order and close together, and the match then covers the left-out text too.
+        """
+        pieces = [normalize(piece)[0].strip() for piece in ELLIPSIS.split(quote)]
+        pieces = [piece for piece in pieces if piece]
+        if not pieces:
             return None
 
-        # Exact match first. Short quotes can occur several times, so prefer the cited page.
-        hits = [m.start() for m in re.finditer(re.escape(needle), self.normalized)]
-
-        if hits:
-            start = next((h for h in hits if self.page_at(self.positions[h]) == page), hits[0])
-            score, end = 100.0, start + len(needle)
-
-        else:
-            match = fuzz.partial_ratio_alignment(needle, self.normalized, score_cutoff=MATCH_THRESHOLD)
+        first = self._find_piece(pieces[0], page, 0, len(self.normalized))
+        if first is None:
+            return None
+        score, start, end = first
+        for piece in pieces[1:]:
+            match = self._find_piece(piece, page, end, end + MAX_GAP + len(piece))
             if match is None:
                 return None
-            score, start, end = match.score, match.dest_start, match.dest_end
+            score, end = min(score, match[0]), match[2]
 
         return score, self.positions[start], self.positions[end - 1] + 1
+
+    def _find_piece(self, needle: str, page: int, low: int, high: int) -> tuple[float, int, int] | None:
+        """Best match of a normalized needle within normalized[low:high], as (score, start, end)."""
+        window = self.normalized[low:high]
+
+        # Exact match first. Short quotes can occur several times, so prefer the cited page.
+        hits = [low + m.start() for m in re.finditer(re.escape(needle), window)]
+        if hits:
+            start = next((h for h in hits if self.page_at(self.positions[h]) == page), hits[0])
+            return 100.0, start, start + len(needle)
+
+        match = fuzz.partial_ratio_alignment(needle, window, score_cutoff=MATCH_THRESHOLD)
+        if match is None:
+            return None
+        return match.score, low + match.dest_start, low + match.dest_end
+
+    def excerpt(self, start: int, end: int) -> str:
+        """The paper's own text between start and end, tidied for reading."""
+        return _tidy(self.text[start:end])
 
     def context(self, start: int, end: int) -> str:
         """The quote plus CONTEXT_SENTENCES whole sentences on each side, from the paper itself."""
@@ -110,17 +132,21 @@ class SourceText:
         after = bisect_left(self.sentence_starts, end) + CONTEXT_SENTENCES
         context_start = self.sentence_starts[before] if before >= 0 else 0
         context_end = self.sentence_starts[after] if after < len(self.sentence_starts) else len(self.text)
-        snippet = self.text[context_start:context_end]
-        # Tidy for reading: rejoin "frame-\nwork", drop markdown, put it all on one line.
-        snippet = re.sub(r"-\n\s*", "", snippet).replace("*", "").replace("#", "")
-        return " ".join(snippet.split())
+        return _tidy(self.text[context_start:context_end])
+
+
+def _tidy(snippet: str) -> str:
+    """Rejoin "frame-\\nwork", drop markdown, and put the text on one line."""
+    snippet = re.sub(r"-\n\s*", "", snippet).replace("*", "").replace("#", "")
+    return " ".join(snippet.split())
 
 
 def verify_claims(rows: list[dict], ocr: dict) -> list[dict]:
-    """Add quote_found, match_score, found_page, context and flags to each reported claim.
+    """Add quote_found, match_score, context and flags to each reported claim.
 
-    When the quote is found, the section is taken from the paper's headings
-    instead of from the model. Rows are updated in place and also returned.
+    When the quote is found, quote, page and section are taken from the paper itself
+    instead of from the model; the model's versions are kept as model_quote and
+    model_page. Rows are updated in place and also returned.
     """
     source = SourceText(ocr)
 
@@ -129,10 +155,13 @@ def verify_claims(rows: list[dict], ocr: dict) -> list[dict]:
             continue
 
         flags = []
-        match = source.find(row["quote"], row["page"])
+        # setdefault: verifying the same rows twice must not overwrite the model's versions.
+        row.setdefault("model_quote", row["quote"])
+        row.setdefault("model_page", row["page"])
+        match = source.find(row["model_quote"], row["model_page"])
 
         if match is None:
-            row.update(quote_found=False, match_score=None, found_page=None, context=None)
+            row.update(quote_found=False, match_score=None, context=None)
             flags.append("quote not found")
 
         else:
@@ -140,19 +169,14 @@ def verify_claims(rows: list[dict], ocr: dict) -> list[dict]:
             row.update(
                 quote_found=True,
                 match_score=round(score),
-                found_page=source.page_at(start),
+                quote=source.excerpt(start, end),
+                page=source.page_at(start),
                 context=source.context(start, end),
                 section=source.section_at(start) or row["section"],
             )
 
-            if row["found_page"] != row["page"]:
-                flags.append(f"cited page {row['page']}, found on page {row['found_page']}")
-
         if len(row["quote"].split()) < SHORT_QUOTE_WORDS:
             flags.append("short quote")
-
-        if "..." in row["quote"] or "…" in row["quote"]:
-            flags.append("shortened with ...")
 
         row["flags"] = "; ".join(flags)
         
