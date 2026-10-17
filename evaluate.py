@@ -4,9 +4,10 @@
     python evaluate.py runs/2026-10-17_101500 runs/2026-10-20_143000  # compare two runs
 
 Reads every review_*.xlsx (and screening.xlsx, if present) in each run folder,
-compares the reviewers' decisions (Judge sheet) with the LLM's (Compare sheet), and
-prints how often they agree, overall and per relation, with a 95% confidence
-interval, plus the include/exclude agreement of the screening. Saves the result as
+compares the reviewers' relations per quote (Judge sheet) with the LLM's (Compare
+sheet), and prints exact agreement, relation precision and recall, and how often the
+LLM's values are right, overall and per relation, plus the include/exclude agreement
+of the screening. Saves the result as
 scores.json in the run folder. Everything is recomputed from what the reviewers
 typed, so it does not depend on the spreadsheet having calculated its formulas.
 """
@@ -19,11 +20,18 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from export import NO_RELATION, read_jsonl, review_items
+from export import JUDGE_COLUMNS, JUDGE_REVIEW_COLUMNS, SUPPORTS_NOTHING, read_jsonl, relation_from_label, review_items
 
 
 def score_run(run_dir: Path) -> dict:
-    """Agreement between reviewers and LLM for all review workbooks in a run folder."""
+    """Agreement between reviewers and LLM for all review workbooks in a run folder.
+
+    Per quote, the reviewer's set of relations is compared with the LLM's:
+        exact       both sets are the same
+        precision   share of the LLM's (quote, relation) pairs the reviewer also gave
+        recall      share of the reviewer's pairs the LLM also gave
+        values      share of quotes with an agreed relation whose LLM value is right
+    """
     totals, per_relation, per_paper, warnings = Counter(), defaultdict(Counter), {}, []
     # How many quotes each paper has in total (the pool its sample was drawn from), for weighting.
     rows = read_jsonl(run_dir / "claims.jsonl")
@@ -34,46 +42,75 @@ def score_run(run_dir: Path) -> dict:
 
     for path in sorted(run_dir.glob("review_*.xlsx")):
         workbook = load_workbook(path)
-        judged = list(_rows(workbook["Judge"]))
+        headers = [cell.value for cell in workbook["Judge"][1]]
+        # The relation columns are labelled "relation (concept)".
+        relation_labels = headers[len(JUDGE_COLUMNS):len(headers) - len(JUDGE_REVIEW_COLUMNS)]
         compared = {row["item_id"]: row for row in _rows(workbook["Compare"])}
         paper = Counter()
 
-        for row in judged:
-            human_relation = (row["human_relation"] or "").strip()
+        for row in _rows(workbook["Judge"]):
+            human = {relation_from_label(label) for label in relation_labels if str(row[label] or "").strip()}
 
-            if not human_relation:
+            # Judged as soon as the row has anything: an x, a value or a reviewer name.
+            if not human and not any(str(row[name] or "").strip() for name in (SUPPORTS_NOTHING, "human_value", "reviewer")):
                 paper["not_judged"] += 1
                 continue
+            llm = {name.strip() for name in (compared[row["item_id"]]["llm_relations"] or "").split(";") if name.strip()}
+            agreed = human & llm
+            value_ok = (compared[row["item_id"]]["value_ok"] or "").strip()
+            llm_only = len(llm - human)
+            correct = _count(compared[row["item_id"]].get("llm_only_correct"))
 
-            llm_relations = [name.strip() for name in (compared[row["item_id"]]["llm_relations"] or "").split(";")]
-            value_match = (compared[row["item_id"]]["value_match"] or "").strip()
-            outcome = Counter(judged=1)
-            outcome["same_relation"] = human_relation in llm_relations
-            outcome["same_relation_and_value"] = outcome["same_relation"] and value_match == "yes"
-            outcome["value_partly"] = outcome["same_relation"] and value_match == "partly"
-            outcome["value_not_compared"] = outcome["same_relation"] and not value_match
-            outcome["human_none"] = human_relation == NO_RELATION
+            if correct > llm_only:
+                warnings.append(f"{path.name} {row['item_id']}: llm_only_correct is {correct}, "
+                                f"but there are only {llm_only} LLM-only relations; counted as {llm_only}")
+                correct = llm_only
+
+            outcome = Counter(judged=1, exact=int(human == llm), human_none=int(not human),
+                              agreed_pairs=len(agreed), llm_pairs=len(llm), human_pairs=len(human),
+                              # Corrected: the LLM-only relations the reviewer marked as right count as agreed.
+                              llm_only_pairs=llm_only, llm_only_correct=correct,
+                              agreed_corrected=len(agreed) + correct, human_corrected=len(human) + correct,
+                              exact_corrected=int(human <= llm and llm_only == correct))
+
+            if agreed:
+                outcome["value_base"] = 1
+                outcome[f"value_{value_ok or 'missing'}"] = 1
+
             paper += outcome
 
-            for relation in llm_relations:
-                per_relation[relation] += outcome
+            for name in llm | human:
+                per_relation[name] += Counter(llm=int(name in llm), human=int(name in human), both=int(name in agreed))
 
-        if paper["not_judged"] or paper["value_not_compared"]:
+        if paper["not_judged"] or paper["value_missing"]:
             warnings.append(f"{path.name}: {paper['not_judged']} quotes not judged, "
-                            f"{paper['value_not_compared']} values not compared yet")
+                            f"{paper['value_missing']} value_ok cells still empty")
 
         per_paper[path.name] = _with_rates(paper)
         per_paper[path.name]["quotes_in_paper"] = quotes_per_paper.get(path.name, 0)
         totals += paper
 
     total = _with_rates(totals)
-    total["weighted"] = {key: _weighted(per_paper, key) for key in ("same_relation", "same_relation_and_value")}
+    total["weighted"] = {
+        "exact": _weighted(per_paper, "exact"),
+        "precision": _weighted_ratio(per_paper, "agreed_pairs", "llm_pairs"),
+        "recall": _weighted_ratio(per_paper, "agreed_pairs", "human_pairs"),
+        "values": _weighted_ratio(per_paper, "value_yes", "value_base"),
+        "llm_only_right": _weighted_ratio(per_paper, "llm_only_correct", "llm_only_pairs"),
+        "exact_corrected": _weighted(per_paper, "exact_corrected"),
+        "precision_corrected": _weighted_ratio(per_paper, "agreed_corrected", "llm_pairs"),
+        "recall_corrected": _weighted_ratio(per_paper, "agreed_corrected", "human_corrected"),
+    }
+    per_relation = {
+        name: {**counts, "precision": _ratio(counts["both"], counts["llm"]), "recall": _ratio(counts["both"], counts["human"])}
+        for name, counts in per_relation.items()
+    }
 
     return {
         "run": str(run_dir),
         "total": total,
         "per_paper": per_paper,
-        "per_relation": {relation: _with_rates(counts) for relation, counts in per_relation.items()},
+        "per_relation": per_relation,
         "screening": score_screening(run_dir / "screening.xlsx", warnings),
         "warnings": warnings,
     }
@@ -134,14 +171,44 @@ def score_screening(path: Path, warnings: list[str]) -> dict | None:
 
 
 def _with_rates(counts: Counter) -> dict:
-    """Counts plus agreement rates with a 95% Wilson confidence interval (sound for small samples)."""
+    """Counts plus rates. The 95% Wilson interval is exact for the per-quote measure; for
+    precision and recall it is approximate, because pairs from one quote are not independent."""
     result = dict(counts)
-    n = counts["judged"]
-
-    for key in ("same_relation", "same_relation_and_value"):
-        result[f"{key}_rate"] = _wilson(counts[key], n)
-
+    result["exact_rate"] = _wilson(counts["exact"], counts["judged"])
+    result["precision"] = _wilson(counts["agreed_pairs"], counts["llm_pairs"])
+    result["recall"] = _wilson(counts["agreed_pairs"], counts["human_pairs"])
+    result["values"] = _wilson(counts["value_yes"], counts["value_base"])
+    result["llm_only_right"] = _wilson(counts["llm_only_correct"], counts["llm_only_pairs"])
+    result["exact_corrected_rate"] = _wilson(counts["exact_corrected"], counts["judged"])
+    result["precision_corrected"] = _wilson(counts["agreed_corrected"], counts["llm_pairs"])
+    result["recall_corrected"] = _wilson(counts["agreed_corrected"], counts["human_corrected"])
     return result
+
+
+def _count(value) -> int:
+    """A whole number typed by a reviewer; empty or unreadable counts as 0."""
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    return round(numerator / denominator, 3) if denominator else None
+
+
+def _weighted_ratio(per_paper: dict, numerator: str, denominator: str) -> dict | None:
+    """A pooled ratio (such as precision) where each paper's sample counts for all its quotes:
+    every judged quote stands for quotes_in_paper / judged quotes of its paper. Point estimate only."""
+    top, bottom = 0.0, 0.0
+
+    for paper in per_paper.values():
+        if paper.get("judged") and paper.get("quotes_in_paper"):
+            scale = paper["quotes_in_paper"] / paper["judged"]
+            top += scale * paper.get(numerator, 0)
+            bottom += scale * paper.get(denominator, 0)
+
+    return {"rate": round(top / bottom, 3)} if bottom else None
 
 
 def _weighted(per_paper: dict, key: str, z: float = 1.96) -> dict | None:
@@ -192,30 +259,52 @@ def _rows(sheet):
 
 
 def _rate(rate: dict | None) -> str:
-    return "-" if rate is None else f"{rate['rate']:.0%} ({rate['low']:.0%}-{rate['high']:.0%})"
+    if rate is None:
+        return "-"
+
+    if "low" not in rate:
+        return f"{rate['rate']:.0%}"
+
+    return f"{rate['rate']:.0%} ({rate['low']:.0%}-{rate['high']:.0%})"
 
 
 def print_scores(scores: list[dict]) -> None:
-    width, column = 40, 24
+    width, column = 46, 24
     print(f"{'':<{width}}" + "".join(f"{Path(s['run']).name:>{column}}" for s in scores))
 
     for key, label in [("judged", "Quotes judged"), ("not_judged", "Quotes not judged yet"),
                        ("human_none", "Reviewer: quote supports nothing")]:
         print(f"{label:<{width}}" + "".join(f"{s['total'].get(key, 0):>{column}}" for s in scores))
 
-    print("\nEvery paper counts equally:")
+    measures = [("exact", "Exactly the same relations"), ("precision", "Relation precision"),
+                ("recall", "Relation recall"), ("values", "Values right (agreed relations)")]
+    print("\nEvery paper counts equally (95% CI):")
 
-    for key, label in [("same_relation_rate", "Same relation (95% CI)"),
-                       ("same_relation_and_value_rate", "Same relation and value (95% CI)")]:
-        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total'].get(key)):>{column}}" for s in scores))
+    for key, label in measures:
+        field = "exact_rate" if key == "exact" else key
+        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total'].get(field)):>{column}}" for s in scores))
 
     print("Weighted by each paper's number of quotes (accuracy per quote in the knowledge base):")
 
-    for key, label in [("same_relation", "Same relation (95% CI)"),
-                       ("same_relation_and_value", "Same relation and value (95% CI)")]:
+    for key, label in measures:
         print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total']['weighted'].get(key)):>{column}}" for s in scores))
 
-    print(f"\nPer relation chosen by the LLM: same relation and value (quotes judged)")
+    # Corrected with llm_only_correct: relations the LLM found and the reviewer missed count as right.
+    corrected = [("llm_only_right", "LLM-only relations right after all"),
+                 ("exact_corrected", "Exactly the same relations"),
+                 ("precision_corrected", "Relation precision"), ("recall_corrected", "Relation recall")]
+    print("\nCorrected for relations the reviewer missed, every paper equally (95% CI):")
+
+    for key, label in corrected:
+        field = "exact_corrected_rate" if key == "exact_corrected" else key
+        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total'].get(field)):>{column}}" for s in scores))
+
+    print("Corrected, weighted by each paper's number of quotes:")
+
+    for key, label in corrected:
+        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total']['weighted'].get(key)):>{column}}" for s in scores))
+
+    print(f"\nPer relation (blind, not corrected): precision / recall (times the LLM chose it)")
     relations = dict.fromkeys(relation for s in scores for relation in s["per_relation"])
 
     for relation in relations:
@@ -223,8 +312,10 @@ def print_scores(scores: list[dict]) -> None:
 
         for s in scores:
             counts = s["per_relation"].get(relation)
+            # "is not None": a precision of exactly 0.0 must still be shown as 0%.
             cells.append("-" if not counts else
-                         f"{_rate(counts['same_relation_and_value_rate'])} ({counts['judged']})")
+                         f"{_rate(None if counts['precision'] is None else {'rate': counts['precision']})} / "
+                         f"{_rate(None if counts['recall'] is None else {'rate': counts['recall']})} ({counts['llm']})")
 
         print(f"  {relation:<{width - 2}}" + "".join(f"{cell:>{column}}" for cell in cells))
 

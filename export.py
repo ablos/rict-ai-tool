@@ -4,9 +4,11 @@ The review is blind: reviewers first see only what the pipeline found (quotes wi
 their context), decide themselves what each quote says, and only then compare with
 what the LLM decided. A review workbook covers one paper and has these sheets:
 
-    Judge      a random sample of quotes; the reviewer picks a relation and writes the value
+    Judge      a random sample of quotes, with one column per relation; the reviewer puts
+               an x under every relation the quote supports and writes the value
     Relations  the ontology's relations and definitions, for reference while judging
-    Compare    the reviewer's decision next to the LLM's (open only after judging)
+    Compare    the reviewer's relations next to the LLM's (open only after judging);
+               the reviewer marks whether the LLM's values are right
     Summary    agreement between reviewer and LLM, overall and per relation
     Run info   the settings of the run
 """
@@ -20,20 +22,25 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
-NO_RELATION = "none"  # reviewer's choice when a quote says nothing the ontology covers
-VALUE_MATCH = ["yes", "partly", "no"]
+VALUE_OK = ["yes", "partly", "no"]
 
+# The Judge sheet: these columns, then one column per relation, then the review columns.
 JUDGE_COLUMNS = ["item_id", "method", "quote", "context", "page", "section"]
-JUDGE_REVIEW_COLUMNS = ["human_relation", "human_value", "notes", "reviewer"]
-COMPARE_COLUMNS = ["item_id", "quote", "human_relation", "llm_relations", "relation_match",
-                   "human_value", "llm_values", "value_match", "notes", "relation_key"]
+SUPPORTS_NOTHING = "supports_nothing"  # x here: the quote supports no relation for this method
+JUDGE_REVIEW_COLUMNS = [SUPPORTS_NOTHING, "human_value", "notes", "reviewer"]
+# The Compare sheet: these visible columns, then hidden helper columns for the formulas.
+# llm_only_correct: of the llm_only relations, how many are right after all (the reviewer missed them).
+COMPARE_COLUMNS = ["item_id", "quote", "human_relations", "llm_relations", "agreed", "llm_only",
+                   "llm_only_correct", "human_only", "human_value", "llm_values", "value_ok", "notes"]
+COMPARE_HELPERS = ["judged", "llm_count", "human_count", "agreed_count", "exact", "exact_corrected"]
 
 # Column widths in characters; columns not listed get DEFAULT_WIDTH.
 WIDTHS = {
-    "method": 20, "quote": 60, "context": 80, "section": 26, "human_relation": 22, "human_value": 30,
-    "notes": 30, "llm_relations": 22, "relation_match": 14, "llm_values": 30, "value_match": 12,
+    "method": 20, "quote": 60, "context": 80, "section": 26, "human_value": 30, "notes": 30,
+    "human_relations": 26, "llm_relations": 26, "agreed": 26, "llm_only": 22, "llm_only_correct": 18, "human_only": 22,
+    "llm_values": 40, "value_ok": 10,
     "relation": 22, "concept": 22, "definition": 90,
-    "paper": 40, "human_decision": 16, "human_methods": 30, "llm_decision": 14, "decision_match": 14,
+    "paper": 40, "human_decision": 16, "human_methods": 30, "llm_decision": 14, "decision_match": 16, "criteria_not_met": 18,
     "llm_included": 30, "llm_rejected": 40,
 }
 DEFAULT_WIDTH = 12
@@ -113,27 +120,53 @@ def write_review_sheet(rows: list[dict], path: str | Path, ontology: dict,
         item["item_id"] = f"Q{number:02d}"
 
     relation_names = [relation["name"] for concept in ontology["concepts"] for relation in concept["relations"]]
+    labels = {relation["name"]: relation_label(concept, relation)
+              for concept in ontology["concepts"] for relation in concept["relations"]}
     workbook = Workbook()
 
     judge = workbook.active
     judge.title = "Judge"
-    _fill_sheet(judge, [[item.get(column) for column in JUDGE_COLUMNS] for item in items],
-                JUDGE_COLUMNS + JUDGE_REVIEW_COLUMNS)
+    judge_headers = JUDGE_COLUMNS + [labels[name] for name in relation_names] + JUDGE_REVIEW_COLUMNS
+    _fill_sheet(judge, [[item.get(column) for column in JUDGE_COLUMNS] for item in items], judge_headers)
+
+    # The relation columns: the label at an angle so it stays readable, and an "x" dropdown.
+    # The x columns run from the first relation up to and including supports_nothing.
+    first, last = _letter(judge_headers, labels[relation_names[0]]), _letter(judge_headers, SUPPORTS_NOTHING)
+    judge.column_dimensions[last].width = 7
+    judge[f"{last}1"].alignment = Alignment(text_rotation=45, vertical="bottom")
+
+    for name in relation_names:
+        judge.column_dimensions[_letter(judge_headers, labels[name])].width = 7
+        judge[f"{_letter(judge_headers, labels[name])}1"].alignment = Alignment(text_rotation=45, vertical="bottom")
+
+    # Room for the longest angled label, e.g. "addressesValue (Ethical or Sustainability Value)".
+    # At 45 degrees a label needs about 0.7 x its length in height: ~4 points per character.
+    judge.row_dimensions[1].height = 4 * max(len(label) for label in labels.values()) + 10
+
+    for cells in judge[f"{first}2:{last}{max(len(items) + 1, 2)}"]:
+        for cell in cells:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    dropdown = DataValidation(type="list", formula1='"x"', allow_blank=True)
+    dropdown.add(f"{first}2:{last}{max(len(items) + 1, 2)}")
+    judge.add_data_validation(dropdown)
+
+    # Narrower text columns, and keep id, method and quote visible while scrolling to the relations.
+    for name, width in (("quote", 45), ("context", 55), ("section", 18)):
+        judge.column_dimensions[_letter(judge_headers, name)].width = width
+
+    judge.freeze_panes = f"{_letter(judge_headers, 'context')}2"
 
     reference = workbook.create_sheet("Relations")
     _fill_sheet(reference, [[relation["name"], concept["label"], relation["definition"]]
-                            for concept in ontology["concepts"] for relation in concept["relations"]]
-                + [[NO_RELATION, "", "The quote says nothing about the method that the ontology covers."]],
+                            for concept in ontology["concepts"] for relation in concept["relations"]],
                 ["relation", "concept", "definition"])
-    # The dropdown reads its choices from the Relations sheet (a typed-out list is limited to 255 characters).
-    _add_dropdown(judge, JUDGE_COLUMNS + JUDGE_REVIEW_COLUMNS, "human_relation",
-                  f"Relations!$A$2:$A${len(relation_names) + 2}", len(items))
 
     compare = workbook.create_sheet("Compare")
-    _add_compare(compare, items)
+    _add_compare(compare, items, relation_names, judge_headers, labels)
 
     summary = workbook.create_sheet("Summary")
-    _add_summary(summary, relation_names, len(items))
+    _add_summary(summary, relation_names, len(items), labels)
 
     if meta:
         info = workbook.create_sheet("Run info")
@@ -232,85 +265,170 @@ def write_screening_sheet(papers: list[dict], path: str | Path, meta: dict | Non
     workbook.save(path)
 
 
-def _add_compare(sheet, items: list[dict]) -> None:
-    """Human decision (copied from Judge by formula) next to the LLM's, row by row."""
-    judge_headers = JUDGE_COLUMNS + JUDGE_REVIEW_COLUMNS
-    human_relation = _letter(judge_headers, "human_relation")
+def _compare_headers(relation_names: list[str]) -> list[str]:
+    """Visible columns, then hidden helpers: 0/1 per relation for the reviewer (H) and the LLM (L)."""
+    return (COMPARE_COLUMNS + COMPARE_HELPERS
+            + [f"H_{name}" for name in relation_names] + [f"L_{name}" for name in relation_names])
+
+
+def _add_compare(sheet, items: list[dict], relation_names: list[str], judge_headers: list[str],
+                 labels: dict[str, str]) -> None:
+    """Per quote: the reviewer's relations (read from Judge by formula) next to the LLM's.
+
+    Hidden helper columns hold a 0/1 per relation for both sides, so agreement can be
+    counted with plain SUM and SUMPRODUCT formulas.
+    """
+    headers = _compare_headers(relation_names)
+    col = {name: _letter(headers, name) for name in headers}
+    reviewer = _letter(judge_headers, "reviewer")
     human_value = _letter(judge_headers, "human_value")
+    marks_first = _letter(judge_headers, labels[relation_names[0]])
+    marks_last = _letter(judge_headers, SUPPORTS_NOTHING)
     data = []
 
-    for row_number, item in enumerate(items, start=2):
-        relations = "; ".join(dict.fromkeys(claim["relation"] for claim in item["claims"]))
-        values = "\n".join(f"{claim['relation']}: {claim['value']}" for claim in item["claims"])
-        # relation_key wraps every name in "; ...;", so "addresses" never matches inside
-        # "addressesValue" when the formulas look a relation up.
-        data.append([item["item_id"], item["quote"], f'=IF(Judge!{human_relation}{row_number}="","",'
-                     f"Judge!{human_relation}{row_number})", relations, None,
-                     f'=IF(Judge!{human_value}{row_number}="","",Judge!{human_value}{row_number})',
-                     values, None, None, f"; {relations};"])
+    for r, item in enumerate(items, start=2):
+        llm = {claim["relation"] for claim in item["claims"]}
+        h = {name: f"{col['H_' + name]}{r}" for name in relation_names}
+        l = {name: f"{col['L_' + name]}{r}" for name in relation_names}
+        h_range = f"{col['H_' + relation_names[0]]}{r}:{col['H_' + relation_names[-1]]}{r}"
+        l_range = f"{col['L_' + relation_names[0]]}{r}:{col['L_' + relation_names[-1]]}{r}"
+        judged = f"{col['judged']}{r}"
 
-    _fill_sheet(sheet, data, COMPARE_COLUMNS)
-    human, match, key = (_letter(COMPARE_COLUMNS, name) for name in ("human_relation", "relation_match", "relation_key"))
+        def names_where(condition) -> str:
+            """A formula listing the relation names for which condition(name) holds."""
+            parts = "&".join(f'IF({condition(name)},"{name}; ","")' for name in relation_names)
+            return f'=IF({judged}=0,"",{parts})'
 
-    for row_number in range(2, len(items) + 2):
-        cell = sheet[f"{match}{row_number}"]
-        cell.value = (f'=IF({human}{row_number}="","",IF(ISNUMBER(SEARCH("; "&{human}{row_number}&";",'
-                      f'{key}{row_number})),"yes","no"))')
+        values = {
+            "item_id": item["item_id"],
+            "quote": item["quote"],
+            "human_relations": names_where(lambda name: f"{h[name]}=1"),
+            "llm_relations": "; ".join(name for name in relation_names if name in llm),
+            "agreed": names_where(lambda name: f"AND({h[name]}=1,{l[name]}=1)"),
+            "llm_only": names_where(lambda name: f"AND({h[name]}=0,{l[name]}=1)"),
+            "human_only": names_where(lambda name: f"AND({h[name]}=1,{l[name]}=0)"),
+            "human_value": f'=IF(Judge!{human_value}{r}="","",Judge!{human_value}{r})',
+            "llm_values": "\n".join(f"{claim['relation']}: {claim['value']}" for claim in item["claims"]),
+            # Judged as soon as the row has anything: an x, a value or a reviewer name.
+            "judged": f'=IF(OR(COUNTA(Judge!{marks_first}{r}:{marks_last}{r})>0,TRIM(Judge!{human_value}{r})<>"",'
+                      f'TRIM(Judge!{reviewer}{r})<>""),1,0)',
+            "llm_count": f"=SUM({l_range})",
+            "human_count": f"=SUM({h_range})",
+            "agreed_count": f"=SUMPRODUCT({h_range},{l_range})",
+            "exact": f'=IF(AND({judged}=1,{col["llm_count"]}{r}={col["human_count"]}{r},'
+                     f'{col["agreed_count"]}{r}={col["llm_count"]}{r}),1,0)',
+            # Corrected: every reviewer relation was found, and all LLM-only relations are right.
+            "exact_corrected": f'=IF(AND({judged}=1,{col["human_count"]}{r}={col["agreed_count"]}{r},'
+                               f'{col["llm_count"]}{r}-{col["agreed_count"]}{r}=N({col["llm_only_correct"]}{r})),1,0)',
+        }
 
-        for column in (human, match, _letter(COMPARE_COLUMNS, "human_value")):
-            sheet[f"{column}{row_number}"].fill = GREY
+        for name in relation_names:
+            values[f"H_{name}"] = f'=IF(TRIM(Judge!{_letter(judge_headers, labels[name])}{r})="",0,1)'
+            values[f"L_{name}"] = 1 if name in llm else 0
 
-    sheet.column_dimensions[key].hidden = True
-    _add_dropdown(sheet, COMPARE_COLUMNS, "value_match", f'"{",".join(VALUE_MATCH)}"', len(items))
+        data.append([values.get(name) for name in headers])
+
+    _fill_sheet(sheet, data, headers)
+
+    for r in range(2, len(items) + 2):
+        for name in ("human_relations", "agreed", "llm_only", "human_only", "human_value"):
+            sheet[f"{col[name]}{r}"].fill = GREY
+
+    for name in COMPARE_HELPERS + [h for h in headers if h.startswith(("H_", "L_"))]:
+        sheet.column_dimensions[col[name]].hidden = True
+
+    _add_dropdown(sheet, headers, "value_ok", f'"{",".join(VALUE_OK)}"', len(items))
+
+    # llm_only_correct takes a whole number from 0 up.
+    counts = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
+    counts.add(f"{col['llm_only_correct']}2:{col['llm_only_correct']}{max(len(items) + 1, 2)}")
+    sheet.add_data_validation(counts)
 
 
-def _add_summary(sheet, relation_names: list[str], item_count: int) -> None:
-    """Agreement between reviewer and LLM, with a 95% margin of error for the sample."""
+def _add_summary(sheet, relation_names: list[str], item_count: int, labels: dict[str, str]) -> None:
+    """Agreement between reviewer and LLM, overall and per relation.
+
+    Relation precision: of the relations the LLM gave the quotes, how many the reviewer also gave.
+    Relation recall:    of the relations the reviewer gave, how many the LLM also gave.
+    Corrected versions also count the LLM-only relations the reviewer marked as right after all.
+    """
+    headers = _compare_headers(relation_names)
     last = item_count + 1
-    human, rel_match, val_match, llm = (f"Compare!${_letter(COMPARE_COLUMNS, name)}$2:${_letter(COMPARE_COLUMNS, name)}${last}"
-                                        for name in ("human_relation", "relation_match", "value_match", "relation_key"))
+
+    def span(name: str) -> str:
+        return f"Compare!${_letter(headers, name)}$2:${_letter(headers, name)}${last}"
+
+    judged, llm_count, human_count, agreed, exact, value_ok, correct, exact_corrected = (
+        span(name) for name in ("judged", "llm_count", "human_count", "agreed_count", "exact", "value_ok",
+                                "llm_only_correct", "exact_corrected"))
 
     sheet.append(["Measure", "Value", "± (95%)"])
     sheet.append(["Quotes in the sample", item_count])
-    sheet.append(["Quotes judged", f'=COUNTIF({rel_match},"yes")+COUNTIF({rel_match},"no")'])
-    sheet.append(["Same relation as the LLM", f'=IFERROR(COUNTIF({rel_match},"yes")/B3,"")',
+    sheet.append(["Quotes judged", f"=SUM({judged})"])
+    sheet.append(["Exactly the same relations as the LLM", f'=IFERROR(SUM({exact})/B3,"")',
                   '=IFERROR(1.96*SQRT(B4*(1-B4)/B3),"")'])
-    sheet.append(["Same relation and same value", f'=IFERROR(COUNTIFS({rel_match},"yes",{val_match},"yes")/B3,"")',
-                  '=IFERROR(1.96*SQRT(B5*(1-B5)/B3),"")'])
-    sheet.append(["Same relation, value partly the same",
-                  f'=IFERROR(COUNTIFS({rel_match},"yes",{val_match},"partly")/B3,"")'])
-    sheet.append(["Reviewer: quote supports nothing (LLM claim unsupported)",
-                  f'=IFERROR(COUNTIF({human},"{NO_RELATION}")/B3,"")'])
+    sheet.append(["Relation precision (LLM's relations the reviewer agrees with)",
+                  f'=IFERROR(SUMPRODUCT({judged},{agreed})/SUMPRODUCT({judged},{llm_count}),"")'])
+    sheet.append(["Relation recall (reviewer's relations the LLM also found)",
+                  f'=IFERROR(SUMPRODUCT({judged},{agreed})/SUMPRODUCT({judged},{human_count}),"")'])
+    sheet.append(["Values right (quotes with at least one agreed relation)",
+                  f'=IFERROR(COUNTIF({value_ok},"yes")/COUNTIFS({agreed},">0",{judged},1),"")'])
+    sheet.append(["Reviewer: quote supports nothing about the method",
+                  f'=IFERROR(COUNTIFS({judged},1,{human_count},0)/B3,"")'])
+    # Rows 9-13: corrected with llm_only_correct, for relations the LLM found and the reviewer missed.
+    sheet.append(["Corrected for relations the reviewer missed (llm_only_correct):"])
+    sheet.append(["LLM-only relations that were right after all",
+                  f'=IFERROR(SUMPRODUCT({judged},{correct})/(SUMPRODUCT({judged},{llm_count})-SUMPRODUCT({judged},{agreed})),"")'])
+    sheet.append(["Exactly the same relations (corrected)", f'=IFERROR(SUM({exact_corrected})/B3,"")',
+                  '=IFERROR(1.96*SQRT(B11*(1-B11)/B3),"")'])
+    sheet.append(["Relation precision (corrected)",
+                  f'=IFERROR((SUMPRODUCT({judged},{agreed})+SUMPRODUCT({judged},{correct}))/SUMPRODUCT({judged},{llm_count}),"")'])
+    sheet.append(["Relation recall (corrected)",
+                  f'=IFERROR((SUMPRODUCT({judged},{agreed})+SUMPRODUCT({judged},{correct}))'
+                  f'/(SUMPRODUCT({judged},{human_count})+SUMPRODUCT({judged},{correct})),"")'])
     sheet.append([])
-    sheet.append(["Relation (as chosen by the LLM)", "Quotes judged", "Same relation", "Same relation and value"])
+    sheet.append(["Relation (blind, not corrected)", "LLM chose", "Reviewer chose", "Both", "Precision", "Recall"])
     header_row = sheet.max_row
 
     for relation in relation_names:
         row = sheet.max_row + 1
-        has_relation = f'"*; {relation};*"'
         sheet.append([
-            relation,
-            f'=COUNTIFS({llm},{has_relation},{rel_match},"yes")+COUNTIFS({llm},{has_relation},{rel_match},"no")',
-            f'=IFERROR(COUNTIFS({llm},{has_relation},{rel_match},"yes")/B{row},"")',
-            f'=IFERROR(COUNTIFS({llm},{has_relation},{rel_match},"yes",{val_match},"yes")/B{row},"")',
+            labels[relation],
+            f"=SUMPRODUCT({judged},{span('L_' + relation)})",
+            f"=SUMPRODUCT({judged},{span('H_' + relation)})",
+            f"=SUMPRODUCT({judged},{span('H_' + relation)},{span('L_' + relation)})",
+            f'=IFERROR(D{row}/B{row},"")',
+            f'=IFERROR(D{row}/C{row},"")',
         ])
 
     for row_number in (1, header_row):
         for cell in sheet[row_number]:
             cell.font = Font(bold=True)
 
-    for row_number in range(4, 8):
+    sheet.cell(9, 1).font = Font(bold=True)
+
+    for row_number in [*range(4, 9), *range(10, 14)]:
         for column in (2, 3):
             sheet.cell(row_number, column).number_format = "0%"
 
     for row_number in range(header_row + 1, sheet.max_row + 1):
-        for column in (3, 4):
+        for column in (5, 6):
             sheet.cell(row_number, column).number_format = "0%"
 
-    sheet.column_dimensions["A"].width = 52
+    sheet.column_dimensions["A"].width = 62
 
-    for column in "BCD":
-        sheet.column_dimensions[column].width = 16
+    for column in "BCDEF":
+        sheet.column_dimensions[column].width = 15
+
+
+def relation_label(concept: dict, relation: dict) -> str:
+    """The Judge column header for a relation, e.g. "addresses (Problem Type)"."""
+    return f"{relation['name']} ({concept['label']})"
+
+
+def relation_from_label(label: str) -> str:
+    """The relation name back from a Judge column header."""
+    return label.split(" (")[0]
 
 
 def _letter(headers: list[str], name: str) -> str:
