@@ -8,17 +8,15 @@ from pathlib import Path
 from mistralai.client import Mistral
 from mistralai.extra import response_format_from_pydantic_model
 from pydantic import BaseModel
-from ontology import build_output_model, describe_ontology, relations
+from ontology import build_output_model, build_screening_model, describe_ontology, relations
 
 EXTRACTION_MODEL = "mistral-large-4-0"
 TEMPERATURE = 0.0
 TOP_P = 1.0 # The API requires 1 when temperature is 0
 RANDOM_SEED = 42
 REASONING_EFFORT = "high"
+TIMEOUT_MS = 20 * 60 * 1000  # the SDK's default of 5 minutes is too short for long papers with reasoning
 PROMPT_DIR = Path("prompts")
-
-class MethodList(BaseModel):
-    methods: list[str]
 
 def paper_text(ocr: dict) -> str:
     """All OCR pages as one text, with a marker before each page so the model can cite pages."""
@@ -40,6 +38,7 @@ def _ask(client: Mistral, system: str, ocr: dict, output_model: type[BaseModel])
         top_p=TOP_P,
         random_seed=RANDOM_SEED,
         reasoning_effort=REASONING_EFFORT,
+        timeout_ms=TIMEOUT_MS,
     )
     choice = response.choices[0]
 
@@ -55,14 +54,29 @@ def _ask(client: Mistral, system: str, ocr: dict, output_model: type[BaseModel])
 
     return output_model.model_validate_json(content)
 
-def identify_methods(client: Mistral, ocr: dict, ontology: dict) -> list[str]:
-    """Names of the methods the paper describes, for when none are given."""
+def screen_methods(client: Mistral, ocr: dict, ontology: dict) -> list[dict]:
+    """The candidate methods in the paper, each checked against every inclusion criterion.
+
+    A candidate is included only if it meets all criteria. That rule is applied here,
+    not left to the model, so it is always applied the same way.
+    """
     subject = ontology["subject"]
     system = load_prompt("identify").format(
         method_definition=subject["definition"],
-        criteria="\n".join(f"- {criterion}" for criterion in subject["criteria"]),    
+        criteria="\n".join(f"- {criterion['id']}: {criterion['text']}" for criterion in subject["criteria"]),
     )
-    return _ask(client, system, ocr, MethodList).methods
+    answer = _ask(client, system, ocr, build_screening_model(ontology))
+    candidates = []
+
+    for candidate in answer.candidates:
+        checks = {criterion["id"]: getattr(candidate, criterion["id"]).model_dump() for criterion in subject["criteria"]}
+        candidates.append({
+            "name": candidate.name,
+            "criteria": checks,
+            "included": all(check["met"] for check in checks.values()),
+        })
+
+    return candidates
 
 def extract_claims(client: Mistral, ocr: dict, method: str, ontology: dict) -> list[dict]:
     """One row per claim, plus one row for each relation without claims."""
@@ -104,8 +118,19 @@ if __name__ == "__main__":
     ontology = load_ontology("config/ontology.yaml")
     ocr = ocr_pdf(client, sys.argv[1])
 
-    # Method names after the PDF path are optional; without them the model picks.
-    methods = sys.argv[2:] or identify_methods(client, ocr, ontology)
+    # Method names after the PDF path are optional; without them the model screens the paper.
+    methods = sys.argv[2:]
+
+    if not methods:
+        for candidate in screen_methods(client, ocr, ontology):
+            print(f"{candidate['name']}: {'included' if candidate['included'] else 'rejected'}")
+
+            for criterion_id, check in candidate["criteria"].items():
+                print(f"  {criterion_id} {'met' if check['met'] else 'NOT met'}: {check['reason']}")
+
+            if candidate["included"]:
+                methods.append(candidate["name"])
+
     print(f"Methods: {methods}\n")
 
     for method in methods:

@@ -23,7 +23,7 @@
 #
 #   Lines marked "OPEN:" are unresolved ontology issues.
 
-version: "0.3"
+version: "0.4"
 
 subject:
   label: Method
@@ -33,10 +33,14 @@ subject:
   examples: [Value Sensitive Design, Ethical Matrix]
 
   # Inclusion criteria, source: https://doi.org/10.1016/j.datak.2024.102373
+  # A method is included only if it meets all of them; papers without such a method are rejected.
   criteria:
-    - "C1: It prescribes a specific way of thinking, made up of directions and rules, structured systematically in activities with corresponding products."
-    - "C2: It aids ethical reasoning: the ability to identify, assess and develop ethical arguments from a variety of ethical positions."
-    - "C3: It is aimed at ICT-related situations, or it comes from another discipline but earlier research has shown that it applies to ICT."
+    - id: C1
+      text: It prescribes a specific way of thinking, made up of directions and rules, structured systematically in activities with corresponding products.
+    - id: C2
+      text: "It aids ethical reasoning: the ability to identify, assess and develop ethical arguments from a variety of ethical positions."
+    - id: C3
+      text: It is aimed at ICT-related situations, or it comes from another discipline but earlier research has shown that it applies to ICT.
 
 concepts:
   - id: problem_type

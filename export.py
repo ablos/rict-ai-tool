@@ -33,6 +33,8 @@ WIDTHS = {
     "method": 20, "quote": 60, "context": 80, "section": 26, "human_relation": 22, "human_value": 30,
     "notes": 30, "llm_relations": 22, "relation_match": 14, "llm_values": 30, "value_match": 12,
     "relation": 22, "concept": 22, "definition": 90,
+    "paper": 40, "human_decision": 16, "human_methods": 30, "llm_decision": 14, "decision_match": 14,
+    "llm_included": 30, "llm_rejected": 40,
 }
 DEFAULT_WIDTH = 12
 
@@ -126,6 +128,80 @@ def write_review_sheet(rows: list[dict], path: str | Path, ontology: dict,
 
     summary = workbook.create_sheet("Summary")
     _add_summary(summary, relation_names, len(items))
+
+    if meta:
+        info = workbook.create_sheet("Run info")
+
+        for key, value in _flatten(meta):
+            info.append([key, value])
+
+        info.column_dimensions["A"].width = 30
+        info.column_dimensions["B"].width = 80
+
+    workbook.save(path)
+
+
+DECISIONS = ["include", "exclude"]
+SCREEN_JUDGE_COLUMNS = ["paper", "human_decision", "human_methods", "notes", "reviewer"]
+SCREEN_COMPARE_COLUMNS = ["paper", "human_decision", "llm_decision", "decision_match",
+                          "llm_included", "llm_rejected", "llm_reasons", "notes"]
+
+
+def write_screening_sheet(papers: list[dict], path: str | Path, meta: dict | None = None) -> None:
+    """A blind check of the screening step: one row per paper.
+
+    Judge     the reviewer decides include/exclude (does the paper describe a method
+              that meets all criteria?) without seeing the LLM's decision
+    Compare   the LLM's decision, its reason per criterion, and whether it matches
+    Summary   how often reviewer and LLM agree, and which way they disagree
+    """
+    workbook = Workbook()
+    judge = workbook.active
+    judge.title = "Judge"
+    _fill_sheet(judge, [[Path(paper["pdf"]).name] for paper in papers], SCREEN_JUDGE_COLUMNS)
+    _add_dropdown(judge, SCREEN_JUDGE_COLUMNS, "human_decision", f'"{",".join(DECISIONS)}"', len(papers))
+
+    compare = workbook.create_sheet("Compare")
+    human = _letter(SCREEN_JUDGE_COLUMNS, "human_decision")
+    data = []
+
+    for row_number, paper in enumerate(papers, start=2):
+        candidates = paper["screening"]
+        included = [candidate["name"] for candidate in candidates if candidate["included"]]
+        rejected = [f"{candidate['name']} ({', '.join(c for c, check in candidate['criteria'].items() if not check['met'])} not met)"
+                    for candidate in candidates if not candidate["included"]]
+        reasons = "\n".join(f"{candidate['name']} - {criterion} {'met' if check['met'] else 'NOT met'}: {check['reason']}"
+                            for candidate in candidates for criterion, check in candidate["criteria"].items())
+        data.append([Path(paper["pdf"]).name, f'=IF(Judge!{human}{row_number}="","",Judge!{human}{row_number})',
+                     "include" if included else "exclude", None,
+                     "\n".join(included), "\n".join(rejected), reasons or "(no candidate methods)", None])
+
+    _fill_sheet(compare, data, SCREEN_COMPARE_COLUMNS)
+    human_c, llm_c, match_c = (_letter(SCREEN_COMPARE_COLUMNS, name) for name in ("human_decision", "llm_decision", "decision_match"))
+
+    for row_number in range(2, len(papers) + 2):
+        compare[f"{match_c}{row_number}"] = (f'=IF({human_c}{row_number}="","",'
+                                             f'IF({human_c}{row_number}={llm_c}{row_number},"yes","no"))')
+
+        for column in (human_c, match_c):
+            compare[f"{column}{row_number}"].fill = GREY
+
+    compare.column_dimensions[_letter(SCREEN_COMPARE_COLUMNS, "llm_reasons")].width = 100
+
+    summary = workbook.create_sheet("Summary")
+    last = len(papers) + 1
+    human_r, llm_r, match_r = (f"Compare!${c}$2:${c}${last}" for c in (human_c, llm_c, match_c))
+    summary.append(["Measure", "Value"])
+    summary.append(["Papers", len(papers)])
+    summary.append(["Papers judged", f'=COUNTIF({match_r},"yes")+COUNTIF({match_r},"no")'])
+    summary.append(["Same decision as the LLM", f'=IFERROR(COUNTIF({match_r},"yes")/B3,"")'])
+    summary.append(["LLM included, reviewer excluded", f'=COUNTIFS({llm_r},"include",{human_r},"exclude")'])
+    summary.append(["LLM excluded, reviewer included", f'=COUNTIFS({llm_r},"exclude",{human_r},"include")'])
+    summary["B4"].number_format = "0%"
+    summary.column_dimensions["A"].width = 40
+
+    for cell in summary[1]:
+        cell.font = Font(bold=True)
 
     if meta:
         info = workbook.create_sheet("Run info")

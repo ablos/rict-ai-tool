@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from mistralai.client import Mistral
 
 import extract
-from export import read_jsonl, write_jsonl, write_review_sheet
+from export import read_jsonl, write_jsonl, write_review_sheet, write_screening_sheet
 from ocr import CACHE_DIR, OCR_MODEL, file_sha256, ocr_pdf
 from ontology import load_ontology
 from verify import verify_claims
@@ -129,7 +129,8 @@ def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict
     """OCR, extraction and verification for one PDF. Errors are recorded, not raised,
     so one bad paper does not stop the others."""
     started = time.time()
-    paper = {"pdf": str(pdf), "sha256": None, "pages": None, "ocr_model": None, "methods": [], "error": None}
+    paper = {"pdf": str(pdf), "sha256": None, "pages": None, "ocr_model": None,
+             "screening": None, "methods": [], "error": None}
     rows = []
 
     try:
@@ -137,10 +138,19 @@ def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict
         paper.update(sha256=ocr["sha256"], pages=len(ocr["pages"]), ocr_model=ocr["model"])
         print(f"{pdf.name}: OCR ready ({len(ocr['pages'])} pages)")
 
-        paper["methods"] = methods or extract.identify_methods(client, ocr, ontology)
+        if methods:
+            paper["methods"] = methods  # chosen by hand, so the paper is not screened
+        else:
+            paper["screening"] = extract.screen_methods(client, ocr, ontology)
+            paper["methods"] = [candidate["name"] for candidate in paper["screening"] if candidate["included"]]
 
-        if not methods:
-            print(f"{pdf.name}: methods found: {paper['methods']}")
+            for candidate in paper["screening"]:
+                failed = [criterion for criterion, check in candidate["criteria"].items() if not check["met"]]
+                print(f"{pdf.name}: {candidate['name']}: "
+                      + ("included" if candidate["included"] else f"rejected ({', '.join(failed)} not met)"))
+
+            if not paper["methods"]:
+                print(f"{pdf.name}: paper rejected, no method meets the criteria")
 
         for method in paper["methods"]:
             method_rows = extract.extract_claims(client, ocr, method, ontology)
@@ -217,6 +227,14 @@ def finish(run_dir: Path, rows: list[dict], meta: dict, ontology: dict) -> None:
         path = run_dir / f"review_{Path(publication).stem}.xlsx"
         write_review_sheet([row for row in rows if row["publication"] == publication], path, ontology,
                            meta["review"]["sample_per_paper"], meta["review"]["seed"], meta)
+        review_files.append(path)
+
+    # Papers screened by the model (no --method given) get a row in the screening sheet.
+    screened = [paper for paper in meta["papers"] if paper.get("screening") is not None]
+
+    if screened:
+        path = run_dir / "screening.xlsx"
+        write_screening_sheet(screened, path, meta)
         review_files.append(path)
 
     save_meta(run_dir, meta)

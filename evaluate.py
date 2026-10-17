@@ -3,9 +3,10 @@
     python evaluate.py runs/2026-10-17_101500                         # one run
     python evaluate.py runs/2026-10-17_101500 runs/2026-10-20_143000  # compare two runs
 
-Reads every review_*.xlsx in each run folder, compares the reviewers' decisions
-(Judge sheet) with the LLM's (Compare sheet), and prints how often they agree,
-overall and per relation, with a 95% confidence interval. Saves the result as
+Reads every review_*.xlsx (and screening.xlsx, if present) in each run folder,
+compares the reviewers' decisions (Judge sheet) with the LLM's (Compare sheet), and
+prints how often they agree, overall and per relation, with a 95% confidence
+interval, plus the include/exclude agreement of the screening. Saves the result as
 scores.json in the run folder. Everything is recomputed from what the reviewers
 typed, so it does not depend on the spreadsheet having calculated its formulas.
 """
@@ -63,8 +64,37 @@ def score_run(run_dir: Path) -> dict:
         "total": _with_rates(totals),
         "per_paper": per_paper,
         "per_relation": {relation: _with_rates(counts) for relation, counts in per_relation.items()},
+        "screening": score_screening(run_dir / "screening.xlsx", warnings),
         "warnings": warnings,
     }
+
+
+def score_screening(path: Path, warnings: list[str]) -> dict | None:
+    """Agreement on include/exclude per paper, from screening.xlsx if the run has one."""
+    if not path.exists():
+        return None
+
+    workbook = load_workbook(path)
+    llm = {row["paper"]: row["llm_decision"] for row in _rows(workbook["Compare"])}
+    counts = Counter()
+
+    for row in _rows(workbook["Judge"]):
+        human = (row["human_decision"] or "").strip()
+
+        if not human:
+            counts["not_judged"] += 1
+            continue
+
+        counts["judged"] += 1
+        counts["same_decision"] += human == llm[row["paper"]]
+        counts[f"llm_{llm[row['paper']]}_human_{human}"] += 1
+
+    if counts["not_judged"]:
+        warnings.append(f"screening.xlsx: {counts['not_judged']} papers not judged")
+
+    result = dict(counts)
+    result["same_decision_rate"] = _wilson(counts["same_decision"], counts["judged"])
+    return result
 
 
 def _with_rates(counts: Counter) -> dict:
@@ -127,6 +157,18 @@ def print_scores(scores: list[dict]) -> None:
 
         print(f"  {relation:<{width - 2}}" + "".join(f"{cell:>{column}}" for cell in cells))
 
+    if any(s["screening"] for s in scores):
+        print("\nScreening (include / exclude per paper)")
+
+        for key, label in [("judged", "Papers judged"),
+                           ("llm_include_human_exclude", "LLM included, reviewer excluded"),
+                           ("llm_exclude_human_include", "LLM excluded, reviewer included")]:
+            print(f"  {label:<{width - 2}}" + "".join(
+                f"{(s['screening'] or {}).get(key, 0) if s['screening'] else '-':>{column}}" for s in scores))
+
+        print(f"  {'Same decision (95% CI)':<{width - 2}}" + "".join(
+            f"{_rate(s['screening']['same_decision_rate']) if s['screening'] else '-':>{column}}" for s in scores))
+
     for s in scores:
         for warning in s["warnings"]:
             print(f"\nWarning ({Path(s['run']).name}): {warning}")
@@ -141,8 +183,8 @@ def main() -> None:
     scores = []
 
     for run_dir in run_dirs:
-        if not list(run_dir.glob("review_*.xlsx")):
-            sys.exit(f"No review_*.xlsx files in {run_dir}")
+        if not list(run_dir.glob("review_*.xlsx")) and not (run_dir / "screening.xlsx").exists():
+            sys.exit(f"No review_*.xlsx or screening.xlsx in {run_dir}")
 
         result = score_run(run_dir)
         (run_dir / "scores.json").write_text(json.dumps(result, indent=2), encoding="utf-8")

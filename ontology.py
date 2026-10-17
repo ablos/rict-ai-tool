@@ -42,6 +42,16 @@ def _check(ontology: dict) -> None:
 
             seen.add(name)
 
+    criterion_ids = [criterion["id"] for criterion in ontology["subject"].get("criteria", [])]
+
+    # Criterion ids also become JSON keys, in the screening output.
+    for criterion_id in criterion_ids:
+        if not criterion_id.isidentifier():
+            raise ValueError(f"Criterion id '{criterion_id}' must be one word, like 'C1'")
+
+    if len(set(criterion_ids)) != len(criterion_ids):
+        raise ValueError("Criterion ids must be unique")
+
 def relations(ontology: dict) -> list[tuple[dict, dict]]:
     """All (concept, relation) pairs, in config order."""
     return [(concept, relation) for concept in ontology["concepts"] for relation in concept["relations"]]
@@ -96,6 +106,27 @@ def build_output_model(ontology: dict) -> type[BaseModel]:
     }
 
     return create_model("MethodExtraction", **fields)
+
+class CriterionCheck(BaseModel):
+    # The reason comes first so the model weighs the evidence before deciding.
+    reason: str = Field(description="One sentence on why, based on what the paper says.")
+    met: bool
+
+def build_screening_model(ontology: dict) -> type[BaseModel]:
+    """A list of candidate methods, each with one required check per inclusion criterion."""
+    checks = {
+        criterion["id"]: (CriterionCheck, Field(description=criterion["text"]))
+        for criterion in ontology["subject"]["criteria"]
+    }
+    candidate = create_model(
+        "CandidateMethod",
+        name=(str, Field(description='The method\'s name as the paper uses it, without a leading "The".')),
+        **checks,
+    )
+
+    return create_model("Screening", candidates=(list[candidate], Field(
+        description="Every method the paper describes, applies or evaluates in some detail, "
+                    "whether or not it meets the criteria.")))
 
 if __name__ == "__main__":
     import json

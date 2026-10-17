@@ -22,9 +22,11 @@ Run from the project root:
 
 ```bash
 python run.py papers/dev/paper.pdf --method "Value Sensitive Design"   # method given
-python run.py papers/dev/*.pdf                                       # model finds the methods
+python run.py papers/dev/*.pdf                                       # model screens the papers
 python run.py papers/heldout/*.pdf --final                           # final evaluation only
 ```
+
+Without `--method`, the model first **screens** each paper: it lists the methods it describes and checks each against the inclusion criteria (C1–C3 in `config/ontology.yaml`). Only methods that meet all criteria are extracted; a paper without one is rejected. With `--method`, screening is skipped.
 
 A paper of ~25 pages takes about 3–4 minutes (OCR is cached, so only the first run per PDF does OCR). `--method` applies to every PDF in the command. `--sample 30` changes how many quotes per paper go into the review sheet (default 20, `0` = all).
 
@@ -32,7 +34,8 @@ Each run creates `runs/<date_time>/`:
 
 | File | What |
 |---|---|
-| `review_<paper>.xlsx` | one review workbook per paper |
+| `review_<paper>.xlsx` | one review workbook per included paper |
+| `screening.xlsx` | one row per screened paper: include or exclude |
 | `claims.jsonl` | all claims after verification (input for the knowledge graph) |
 | `extracted.jsonl` | raw model output |
 | `meta.json` | ontology version, prompt hashes, model, settings, git commit, timings |
@@ -44,6 +47,8 @@ Each workbook holds a random sample of quotes the pipeline found, spread over th
 1. **Judge** — for each quote, read `quote` and `context` (both straight from the paper), then pick the `human_relation` it supports (dropdown; `none` if it supports nothing) and write the `human_value` in a few words. Fill in `reviewer`. The **Relations** tab has the definitions.
 2. Only when all quotes are judged, open **Compare**. It shows your decision next to the LLM's; `relation_match` fills in by itself. Set `value_match` to `yes`, `partly` or `no` for each row.
 3. **Summary** shows the agreement for this paper.
+
+**Screening** (`screening.xlsx`, same idea): on the **Judge** tab, decide per paper `include` or `exclude` — does it describe a method that meets all criteria? — and which method. Then open **Compare** for the LLM's decision and its reason per criterion.
 
 When all papers of a run are reviewed, add them up (with 95% confidence intervals):
 
