@@ -107,6 +107,28 @@ class SourceText:
 
         return score, self.positions[start], self.positions[end - 1] + 1
 
+    def find_interrupted(self, quote: str, page: int) -> tuple[float, int, int] | None:
+        """A quote that the paper's text interrupts, e.g. with footnotes that OCR placed in
+        the middle of a sentence at a page break.
+
+        The quote is cut in two (each part at least 3 words); both parts must appear
+        exactly, the second within MAX_GAP characters after the first. Text joined
+        from different places in another order still does not match.
+        """
+        words = normalize(quote)[0].strip().split(" ")
+
+        for cut in range(3, len(words) - 2):
+            head, tail = " ".join(words[:cut]), " ".join(words[cut:])
+
+            for hit in re.finditer(re.escape(head), self.normalized):
+                window_end = hit.end() + MAX_GAP + len(tail)
+                rest = self.normalized.find(tail, hit.end(), window_end)
+
+                if rest >= 0:
+                    return 100.0, self.positions[hit.start()], self.positions[rest + len(tail) - 1] + 1
+
+        return None
+
     def _find_piece(self, needle: str, page: int, low: int, high: int) -> tuple[float, int, int] | None:
         """Best match of a normalized needle within normalized[low:high], as (score, start, end)."""
         window = self.normalized[low:high]
@@ -159,6 +181,12 @@ def verify_claims(rows: list[dict], ocr: dict) -> list[dict]:
         row.setdefault("model_quote", row["quote"])
         row.setdefault("model_page", row["page"])
         match = source.find(row["model_quote"], row["model_page"])
+
+        if match is None:
+            match = source.find_interrupted(row["model_quote"], row["model_page"])
+
+            if match is not None:
+                flags.append("quote interrupted by other text in the paper (e.g. footnotes)")
 
         if match is None:
             row.update(quote_found=False, match_score=None, context=None)
