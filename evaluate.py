@@ -12,6 +12,7 @@ scores.json in the run folder. Everything is recomputed from what the reviewers
 typed, so it does not depend on the spreadsheet having calculated its formulas.
 """
 
+import argparse
 import json
 import math
 import sys
@@ -23,8 +24,9 @@ from openpyxl import load_workbook
 from export import JUDGE_COLUMNS, JUDGE_REVIEW_COLUMNS, SUPPORTS_NOTHING, read_jsonl, relation_from_label, review_items
 
 
-def score_run(run_dir: Path) -> dict:
+def score_run(run_dir: Path, complete_only: bool = False) -> dict:
     """Agreement between reviewers and LLM for all review workbooks in a run folder.
+    With complete_only, papers with quotes not judged yet are left out entirely.
 
     Per quote, the reviewer's set of relations is compared with the LLM's:
         exact       both sets are the same
@@ -32,7 +34,7 @@ def score_run(run_dir: Path) -> dict:
         recall      share of the reviewer's pairs the LLM also gave
         values      share of quotes with an agreed relation whose LLM value is right
     """
-    totals, per_relation, per_paper, warnings = Counter(), defaultdict(Counter), {}, []
+    per_paper, relations_by_paper, warnings = {}, {}, []
     # How many quotes each paper has in total (the pool its sample was drawn from), for weighting.
     rows = read_jsonl(run_dir / "claims.jsonl")
     quotes_per_paper = {
@@ -46,7 +48,10 @@ def score_run(run_dir: Path) -> dict:
         # The relation columns are labelled "relation (concept)".
         relation_labels = headers[len(JUDGE_COLUMNS):len(headers) - len(JUDGE_REVIEW_COLUMNS)]
         compared = {row["item_id"]: row for row in _rows(workbook["Compare"])}
-        paper = Counter()
+        # The Compare step counts as done once any value_ok or llm_only_correct is filled in.
+        compare_done = any(str(row.get(name) or "").strip()
+                           for row in compared.values() for name in ("value_ok", "llm_only_correct"))
+        paper, paper_relations = Counter(), defaultdict(Counter)
 
         for row in _rows(workbook["Judge"]):
             human = {relation_from_label(label) for label in relation_labels if str(row[label] or "").strip()}
@@ -73,22 +78,48 @@ def score_run(run_dir: Path) -> dict:
                               agreed_corrected=len(agreed) + correct, human_corrected=len(human) + correct,
                               exact_corrected=int(human <= llm and llm_only == correct))
 
+            # Only filled-in value_ok cells count; an empty one is "not compared yet", not "wrong".
             if agreed:
-                outcome["value_base"] = 1
                 outcome[f"value_{value_ok or 'missing'}"] = 1
+                outcome["value_base"] = int(bool(value_ok))
+
+            # The corrected measures only use papers whose Compare step was done; otherwise
+            # an empty llm_only_correct would be read as "0 overlooked relations". For those
+            # papers, c_* keep the blind counts too, so blind and corrected can be compared
+            # on exactly the same quotes.
+            if not compare_done:
+                for key in ("llm_only_pairs", "llm_only_correct", "agreed_corrected", "human_corrected", "exact_corrected"):
+                    del outcome[key]
+            else:
+                outcome.update(compared=1, c_exact=int(human == llm), c_agreed=len(agreed),
+                               c_llm=len(llm), c_human=len(human))
 
             paper += outcome
 
             for name in llm | human:
-                per_relation[name] += Counter(llm=int(name in llm), human=int(name in human), both=int(name in agreed))
+                paper_relations[name] += Counter(llm=int(name in llm), human=int(name in human), both=int(name in agreed))
 
-        if paper["not_judged"] or paper["value_missing"]:
+        if not compare_done and paper["judged"]:
+            warnings.append(f"{path.name}: Compare step not done yet; left out of values and corrected measures")
+        elif paper["not_judged"] or paper["value_missing"]:
             warnings.append(f"{path.name}: {paper['not_judged']} quotes not judged, "
                             f"{paper['value_missing']} value_ok cells still empty")
 
+        if complete_only and (paper["not_judged"] or not paper["judged"]):
+            warnings.append(f"{path.name}: left out (--complete-only): {paper['not_judged']} quotes not judged")
+            continue
+
         per_paper[path.name] = _with_rates(paper)
         per_paper[path.name]["quotes_in_paper"] = quotes_per_paper.get(path.name, 0)
-        totals += paper
+        per_paper[path.name]["counts"] = paper
+        relations_by_paper[path.name] = paper_relations
+
+    totals = sum((paper.pop("counts") for paper in per_paper.values()), Counter())
+    per_relation = defaultdict(Counter)
+
+    for paper_relations in relations_by_paper.values():
+        for name, counts in paper_relations.items():
+            per_relation[name] += counts
 
     total = _with_rates(totals)
     total["weighted"] = {
@@ -97,9 +128,13 @@ def score_run(run_dir: Path) -> dict:
         "recall": _weighted_ratio(per_paper, "agreed_pairs", "human_pairs"),
         "values": _weighted_ratio(per_paper, "value_yes", "value_base"),
         "llm_only_right": _weighted_ratio(per_paper, "llm_only_correct", "llm_only_pairs"),
-        "exact_corrected": _weighted(per_paper, "exact_corrected"),
-        "precision_corrected": _weighted_ratio(per_paper, "agreed_corrected", "llm_pairs"),
+        "exact_corrected": _weighted(per_paper, "exact_corrected", n_key="compared"),
+        "precision_corrected": _weighted_ratio(per_paper, "agreed_corrected", "c_llm"),
         "recall_corrected": _weighted_ratio(per_paper, "agreed_corrected", "human_corrected"),
+        # Blind, on the same papers as the corrected measures.
+        "exact_compared": _weighted(per_paper, "c_exact", n_key="compared"),
+        "precision_compared": _weighted_ratio(per_paper, "c_agreed", "c_llm"),
+        "recall_compared": _weighted_ratio(per_paper, "c_agreed", "c_human"),
     }
     per_relation = {
         name: {**counts, "precision": _ratio(counts["both"], counts["llm"]), "recall": _ratio(counts["both"], counts["human"])}
@@ -179,9 +214,13 @@ def _with_rates(counts: Counter) -> dict:
     result["recall"] = _wilson(counts["agreed_pairs"], counts["human_pairs"])
     result["values"] = _wilson(counts["value_yes"], counts["value_base"])
     result["llm_only_right"] = _wilson(counts["llm_only_correct"], counts["llm_only_pairs"])
-    result["exact_corrected_rate"] = _wilson(counts["exact_corrected"], counts["judged"])
-    result["precision_corrected"] = _wilson(counts["agreed_corrected"], counts["llm_pairs"])
+    result["exact_corrected_rate"] = _wilson(counts["exact_corrected"], counts["compared"])
+    result["precision_corrected"] = _wilson(counts["agreed_corrected"], counts["c_llm"])
     result["recall_corrected"] = _wilson(counts["agreed_corrected"], counts["human_corrected"])
+    # Blind, on the same papers as the corrected measures.
+    result["exact_compared"] = _wilson(counts["c_exact"], counts["compared"])
+    result["precision_compared"] = _wilson(counts["c_agreed"], counts["c_llm"])
+    result["recall_compared"] = _wilson(counts["c_agreed"], counts["c_human"])
     return result
 
 
@@ -211,14 +250,15 @@ def _weighted_ratio(per_paper: dict, numerator: str, denominator: str) -> dict |
     return {"rate": round(top / bottom, 3)} if bottom else None
 
 
-def _weighted(per_paper: dict, key: str, z: float = 1.96) -> dict | None:
+def _weighted(per_paper: dict, key: str, n_key: str = "judged", z: float = 1.96) -> dict | None:
     """Agreement rate per quote in the whole run: each paper counts in proportion to its
     number of quotes, not equally (stratified estimate, one stratum per paper).
+    n_key is the count of sampled quotes the rate is over (judged, or compared).
 
     The margin uses the stratified-sampling variance with a finite population correction,
     since a sample of 20 can be a large share of a small paper.
     """
-    papers = [paper for paper in per_paper.values() if paper.get("judged") and paper.get("quotes_in_paper")]
+    papers = [paper for paper in per_paper.values() if paper.get(n_key) and paper.get("quotes_in_paper")]
     total_quotes = sum(paper["quotes_in_paper"] for paper in papers)
 
     if not total_quotes:
@@ -228,7 +268,7 @@ def _weighted(per_paper: dict, key: str, z: float = 1.96) -> dict | None:
 
     for paper in papers:
         weight = paper["quotes_in_paper"] / total_quotes
-        n, size = paper["judged"], paper["quotes_in_paper"]
+        n, size = paper[n_key], paper["quotes_in_paper"]
         p = paper.get(key, 0) / n
         rate += weight * p
         correction = (size - n) / (size - 1) if size > 1 else 0.0
@@ -290,10 +330,16 @@ def print_scores(scores: list[dict]) -> None:
         print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total']['weighted'].get(key)):>{column}}" for s in scores))
 
     # Corrected with llm_only_correct: relations the LLM found and the reviewer missed count as right.
+    print("\nBlind, only papers with the Compare step done (same papers as below), every paper equally:")
+
+    for key, label in [("exact_compared", "Exactly the same relations"), ("precision_compared", "Relation precision"),
+                       ("recall_compared", "Relation recall")]:
+        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total'].get(key)):>{column}}" for s in scores))
+
     corrected = [("llm_only_right", "LLM-only relations right after all"),
                  ("exact_corrected", "Exactly the same relations"),
                  ("precision_corrected", "Relation precision"), ("recall_corrected", "Relation recall")]
-    print("\nCorrected for relations the reviewer missed, every paper equally (95% CI):")
+    print("Corrected for relations the reviewer missed, every paper equally (95% CI):")
 
     for key, label in corrected:
         field = "exact_corrected_rate" if key == "exact_corrected" else key
@@ -338,23 +384,89 @@ def print_scores(scores: list[dict]) -> None:
             print(f"\nWarning ({Path(s['run']).name}): {warning}")
 
 
+def write_latex(score: dict, path: Path) -> None:
+    """The headline numbers as LaTeX commands, plus a table per paper, for the paper.
+
+    \\input{results.tex} in the paper and write e.g. "precision was \\ResPrecision{}";
+    re-running evaluate.py then updates every number in the paper.
+    """
+    total, weighted = score["total"], score["total"]["weighted"]
+
+    def percent(rate: dict | None) -> str:
+        return "--" if rate is None else f"{rate['rate'] * 100:.0f}\\%"
+
+    def interval(rate: dict | None) -> str:
+        return "--" if rate is None or "low" not in rate else f"{rate['low'] * 100:.0f}--{rate['high'] * 100:.0f}\\%"
+
+    def ratio(numerator: int, denominator: int) -> str:
+        return f"{numerator / denominator * 100:.0f}\\%" if denominator else "--"
+
+    commands = {
+        # Counts
+        "ResPapers": str(len(score["per_paper"])),
+        "ResPapersCompared": str(sum(1 for paper in score["per_paper"].values() if paper.get("compared"))),
+        "ResQuotes": str(total.get("judged", 0)),
+        "ResQuotesCompared": str(total.get("compared", 0)),
+        "ResSupportsNothing": ratio(total.get("human_none", 0), total.get("judged", 0)),
+        # Blind, all reviewed papers, weighted by quotes per paper
+        "ResExact": percent(weighted["exact"]), "ResExactCI": interval(weighted["exact"]),
+        "ResPrecision": percent(weighted["precision"]), "ResRecall": percent(weighted["recall"]),
+        # Blind, every paper equally
+        "ResExactEqual": percent(total["exact_rate"]), "ResExactEqualCI": interval(total["exact_rate"]),
+        "ResPrecisionEqual": percent(total["precision"]), "ResRecallEqual": percent(total["recall"]),
+        # Papers with the Compare step done: values, blind vs corrected on the same papers
+        "ResValues": percent(weighted["values"]),
+        "ResLlmOnlyRight": percent(weighted["llm_only_right"]),
+        "ResExactCompared": percent(weighted["exact_compared"]),
+        "ResPrecisionCompared": percent(weighted["precision_compared"]),
+        "ResRecallCompared": percent(weighted["recall_compared"]),
+        "ResExactCorrected": percent(weighted["exact_corrected"]),
+        "ResPrecisionCorrected": percent(weighted["precision_corrected"]),
+        "ResRecallCorrected": percent(weighted["recall_corrected"]),
+    }
+
+    lines = ["% Generated by evaluate.py from " + score["run"] + " -- do not edit by hand."]
+    lines += [f"\\newcommand{{\\{name}}}{{{value}}}" for name, value in commands.items()]
+    lines += [
+        "",
+        "\\newcommand{\\ResPaperTable}{%",
+        "\\begin{tabular}{lrrrrrr}",
+        "\\hline",
+        "Publication & Quotes & Exact & Precision & Recall & Values & Corr.\\ precision \\\\",
+        "\\hline",
+    ]
+
+    for name, paper in score["per_paper"].items():
+        title = name.removeprefix("review_").removesuffix(".xlsx").replace("_", " ")
+        corrected = ratio(paper.get("agreed_corrected", 0), paper.get("c_llm", 0)) if paper.get("compared") else "--"
+        lines.append(f"{title} & {paper.get('judged', 0)} & {ratio(paper.get('exact', 0), paper.get('judged', 0))} & "
+                     f"{ratio(paper.get('agreed_pairs', 0), paper.get('llm_pairs', 0))} & "
+                     f"{ratio(paper.get('agreed_pairs', 0), paper.get('human_pairs', 0))} & "
+                     f"{ratio(paper.get('value_yes', 0), paper.get('value_base', 0))} & {corrected} \\\\")
+
+    lines += ["\\hline", "\\end{tabular}}", ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
-    run_dirs = [Path(arg) for arg in sys.argv[1:]]
-
-    if not run_dirs:
-        sys.exit(__doc__)
-
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("run_dirs", nargs="+", type=Path, help="run folders with reviewed workbooks")
+    parser.add_argument("--complete-only", action="store_true",
+                        help="leave out papers whose review is not finished")
+    args = parser.parse_args()
     scores = []
 
-    for run_dir in run_dirs:
+    for run_dir in args.run_dirs:
         if not list(run_dir.glob("review_*.xlsx")) and not (run_dir / "screening.xlsx").exists():
             sys.exit(f"No review_*.xlsx or screening.xlsx in {run_dir}")
 
-        result = score_run(run_dir)
+        result = score_run(run_dir, args.complete_only)
         (run_dir / "scores.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        write_latex(result, run_dir / "results.tex")
         scores.append(result)
 
     print_scores(scores)
+    print("\nLaTeX numbers written to " + ", ".join(str(run_dir / "results.tex") for run_dir in args.run_dirs))
 
 
 if __name__ == "__main__":
