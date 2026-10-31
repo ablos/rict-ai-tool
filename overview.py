@@ -143,11 +143,13 @@ def _screening_section(path: Path) -> list[str]:
 
         mark = " **≠**" if human and human != llm_decision else ""
         note = _text(row.get("notes")) or _text((compared or {}).get("notes"))
-        rows.append(f"| {row['paper']} | {row['method']} | {llm_decision} | {human or '-'}{mark} | "
-                    f"{_text(compared.get('criteria_not_met')) if compared else ''} | {note} |")
+        # Per criterion: reviewer / LLM, e.g. "met / not met".
+        criteria = " · ".join(f"{c}: {_text(row.get(c)) or '-'} / {_text((compared or {}).get(f'llm_{c}')) or '-'}"
+                              for c in ("C1", "C2", "C3"))
+        rows.append(f"| {row['paper']} | {row['method']} | {llm_decision} | {human or '-'}{mark} | {criteria} | {note} |")
 
     return (["\n## Screening\n"] + [f"- {key}: {value}" for key, value in sorted(summary.items())]
-            + ["\n| Paper | Method | LLM | Reviewer | Criteria not met (LLM) | Notes |", "|---|---|---|---|---|---|"]
+            + ["\n| Paper | Method | LLM | Reviewer | Criteria (reviewer / LLM) | Notes |", "|---|---|---|---|---|---|"]
             + rows)
 
 

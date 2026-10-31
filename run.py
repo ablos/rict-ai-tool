@@ -31,7 +31,7 @@ from mistralai.client import Mistral
 from mistralai.client.utils import BackoffStrategy, RetryConfig
 
 import extract
-from export import read_jsonl, write_jsonl, write_review_sheet, write_screening_sheet
+from export import read_jsonl, read_screening_judgements, write_jsonl, write_review_sheet, write_screening_sheet
 from ocr import CACHE_DIR, OCR_MODEL, ocr_pdf
 from ontology import load_ontology
 from verify import verify_claims
@@ -318,7 +318,8 @@ def finish(run_dir: Path, rows: list[dict], meta: dict, ontology: dict) -> None:
 
     if screened:
         path = run_dir / "screening.xlsx"
-        write_screening_sheet(screened, path, meta)
+        # A rebuild keeps the reviewers' screening judgements (the review workbooks are redrawn instead).
+        write_screening_sheet(screened, path, meta, previous=read_screening_judgements(path))
         review_files.append(path)
 
     save_meta(run_dir, meta)

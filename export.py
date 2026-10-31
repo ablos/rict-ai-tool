@@ -209,75 +209,149 @@ def _protect(sheet, editable: list[str], headers: list[str], last_row: int) -> N
     sheet.protection.autoFilter = False
 
 
-DECISIONS = ["include", "exclude"]
+DECISIONS = ["include", "exclude", "pending"]
+# "not in this paper": the paper gives no evidence either way. Evidence (e.g. of an ICT application
+# for C3) can come from another publication about the method, so this does not mean "not met".
+CRITERION_JUDGEMENTS = ["met", "not met", "not in this paper"]
 NO_METHOD_FOUND = "(no method found)"  # the row for a paper where the LLM found no candidate method
-SCREEN_JUDGE_COLUMNS = ["paper", "method", "human_decision", "notes", "reviewer"]
-SCREEN_COMPARE_COLUMNS = ["paper", "method", "human_decision", "llm_decision", "decision_match",
-                          "criteria_not_met", "llm_reasons", "notes"]
+SCREEN_CRITERIA = ["C1", "C2", "C3"]
+SCREEN_JUDGE_COLUMNS = ["paper", "method"] + SCREEN_CRITERIA + ["human_decision", "notes", "reviewer"]
+SCREEN_COMPARE_COLUMNS = (["paper", "method", "human_decision", "llm_decision", "decision_match"]
+                          + [f"{side}_{c}" for c in SCREEN_CRITERIA for side in ("human", "llm")]
+                          + ["llm_reasons", "notes"])
 
 
-def write_screening_sheet(papers: list[dict], path: str | Path, meta: dict | None = None) -> None:
-    """A blind check of the screening step: one row per candidate method the LLM found.
+def read_screening_judgements(path: str | Path) -> dict:
+    """The reviewer's input in an existing screening.xlsx (old or new layout), keyed by
+    (paper, method), so a rebuilt sheet keeps it. Rows a reviewer added are included."""
+    if not Path(path).exists():
+        return {}
 
-    Judge     the reviewer decides include/exclude per method (does it meet all criteria?)
-              without seeing the LLM's decision; methods the LLM missed can be added as rows
-    Compare   the LLM's decision, its reason per criterion, and whether it matches
-    Summary   how often reviewer and LLM agree, and which way they disagree
+    from openpyxl import load_workbook
+
+    judge = load_workbook(path)["Judge"]
+    headers = [cell.value for cell in judge[1]]
+    judgements = {}
+
+    for values in judge.iter_rows(min_row=2, values_only=True):
+        row = dict(zip(headers, values))
+
+        if row.get("paper") and row.get("method"):
+            kept = {name: row.get(name) for name in SCREEN_CRITERIA + ["human_decision", "notes", "reviewer"]
+                    if row.get(name) not in (None, "")}
+
+            if kept:
+                judgements[(row["paper"], row["method"])] = kept
+
+    return judgements
+
+
+def write_screening_sheet(papers: list[dict], path: str | Path, meta: dict | None = None,
+                          previous: dict | None = None) -> None:
+    """A check of the screening step: one row per candidate method the LLM found.
+
+    Judge     per method, the reviewer judges each criterion (met / not met / not in this
+              paper) and decides include, exclude, or pending (C1 and C2 met, but the
+              evidence for a criterion has to come from another publication), without
+              seeing the LLM's decision. Methods the LLM missed can be added as rows.
+    Compare   the reviewer's judgements next to the LLM's, per criterion and for the decision
+    Summary   agreement, and which way the decisions differ
+
+    previous: reviewer input from an earlier version of the sheet (read_screening_judgements),
+    written back into the matching rows.
     """
+    previous = dict(previous or {})
     rows = []
 
     for paper in papers:
         name = Path(paper["pdf"]).name
 
         for candidate in paper["screening"]:
-            failed = [criterion for criterion, check in candidate["criteria"].items() if not check["met"]]
+            checks = candidate["criteria"]
             reasons = "\n".join(f"{criterion} {'met' if check['met'] else 'NOT met'}: {check['reason']}"
-                                for criterion, check in candidate["criteria"].items())
-            rows.append([name, candidate["name"], "include" if candidate["included"] else "exclude",
-                         ", ".join(failed), reasons])
+                                for criterion, check in checks.items())
+            llm_criteria = {c: ("met" if checks[c]["met"] else "not met") if c in checks else "" for c in SCREEN_CRITERIA}
+            rows.append({"paper": name, "method": candidate["name"],
+                         "llm_decision": "include" if candidate["included"] else "exclude",
+                         "llm_criteria": llm_criteria, "reasons": reasons})
 
         if not paper["screening"]:
-            rows.append([name, NO_METHOD_FOUND, "exclude", "", "The LLM found no candidate method in this paper."])
+            rows.append({"paper": name, "method": NO_METHOD_FOUND, "llm_decision": "exclude",
+                         "llm_criteria": {c: "" for c in SCREEN_CRITERIA},
+                         "reasons": "The LLM found no candidate method in this paper."})
+
+    def reviewer_values(paper: str, method: str) -> list:
+        kept = previous.pop((paper, method), {})
+        return [kept.get(c) for c in SCREEN_CRITERIA] + [kept.get("human_decision"), kept.get("notes"), kept.get("reviewer")]
 
     workbook = Workbook()
     judge = workbook.active
     judge.title = "Judge"
-    _fill_sheet(judge, [[paper, method] for paper, method, *_ in rows], SCREEN_JUDGE_COLUMNS)
-    # Room below the rows, so reviewers can add methods the LLM missed.
-    _add_dropdown(judge, SCREEN_JUDGE_COLUMNS, "human_decision", f'"{",".join(DECISIONS)}"', len(rows) + 50)
+    data = [[row["paper"], row["method"]] + reviewer_values(row["paper"], row["method"]) for row in rows]
+    # Methods a reviewer added earlier (missed by the LLM) are kept below the LLM's methods.
+    data += [[paper, method] + reviewer_values(paper, method) for paper, method in list(previous)]
+    _fill_sheet(judge, data, SCREEN_JUDGE_COLUMNS)
+    editable_rows = len(data) + 50  # room below, for methods the LLM missed
+
+    for criterion in SCREEN_CRITERIA:
+        _add_dropdown(judge, SCREEN_JUDGE_COLUMNS, criterion, f'"{",".join(CRITERION_JUDGEMENTS)}"', editable_rows)
+
+    _add_dropdown(judge, SCREEN_JUDGE_COLUMNS, "human_decision", f'"{",".join(DECISIONS)}"', editable_rows)
+
+    for criterion in SCREEN_CRITERIA:
+        judge.column_dimensions[_letter(SCREEN_JUDGE_COLUMNS, criterion)].width = 16
 
     compare = workbook.create_sheet("Compare")
-    human = _letter(SCREEN_JUDGE_COLUMNS, "human_decision")
-    data = [[paper, method, f'=IF(Judge!{human}{row_number}="","",Judge!{human}{row_number})',
-             llm_decision, None, failed, reasons, None]
-            for row_number, (paper, method, llm_decision, failed, reasons) in enumerate(rows, start=2)]
-    _fill_sheet(compare, data, SCREEN_COMPARE_COLUMNS)
-    human_c, llm_c, match_c = (_letter(SCREEN_COMPARE_COLUMNS, name) for name in ("human_decision", "llm_decision", "decision_match"))
+    judge_col = {name: _letter(SCREEN_JUDGE_COLUMNS, name) for name in SCREEN_JUDGE_COLUMNS}
+
+    def from_judge(name: str, row_number: int) -> str:
+        return f'=IF(Judge!{judge_col[name]}{row_number}="","",Judge!{judge_col[name]}{row_number})'
+
+    compare_data = []
+
+    for row_number, row in enumerate(rows, start=2):
+        values = {"paper": row["paper"], "method": row["method"],
+                  "human_decision": from_judge("human_decision", row_number), "llm_decision": row["llm_decision"],
+                  "llm_reasons": row["reasons"]}
+
+        for criterion in SCREEN_CRITERIA:
+            values[f"human_{criterion}"] = from_judge(criterion, row_number)
+            values[f"llm_{criterion}"] = row["llm_criteria"][criterion]
+
+        compare_data.append([values.get(name) for name in SCREEN_COMPARE_COLUMNS])
+
+    _fill_sheet(compare, compare_data, SCREEN_COMPARE_COLUMNS)
+    col = {name: _letter(SCREEN_COMPARE_COLUMNS, name) for name in SCREEN_COMPARE_COLUMNS}
 
     for row_number in range(2, len(rows) + 2):
-        compare[f"{match_c}{row_number}"] = (f'=IF({human_c}{row_number}="","",'
-                                             f'IF({human_c}{row_number}={llm_c}{row_number},"yes","no"))')
+        compare[f"{col['decision_match']}{row_number}"] = (
+            f'=IF({col["human_decision"]}{row_number}="","",'
+            f'IF({col["human_decision"]}{row_number}={col["llm_decision"]}{row_number},"yes","no"))')
 
-        for column in (human_c, match_c):
-            compare[f"{column}{row_number}"].fill = GREY
+        for name in ["human_decision", "decision_match"] + [f"human_{c}" for c in SCREEN_CRITERIA]:
+            compare[f"{col[name]}{row_number}"].fill = GREY
 
-    compare.column_dimensions[_letter(SCREEN_COMPARE_COLUMNS, "llm_reasons")].width = 100
+    compare.column_dimensions[col["llm_reasons"]].width = 100
 
     summary = workbook.create_sheet("Summary")
     last = len(rows) + 1
-    human_r, llm_r, match_r = (f"Compare!${c}$2:${c}${last}" for c in (human_c, llm_c, match_c))
-    judge_method = f"Judge!$B${last + 1}:$B$1000"
-    judge_decision = f"Judge!${human}${last + 1}:${human}$1000"
+    human_r, llm_r, match_r = (f"Compare!${col[c]}$2:${col[c]}${last}" for c in ("human_decision", "llm_decision", "decision_match"))
+    added_method = f"Judge!${judge_col['method']}${last + 1}:${judge_col['method']}$1000"
+    added_decision = f"Judge!${judge_col['human_decision']}${last + 1}:${judge_col['human_decision']}$1000"
     summary.append(["Measure (per method)", "Value"])
     summary.append(["Methods found by the LLM", len(rows)])
     summary.append(["Methods judged", f'=COUNTIF({match_r},"yes")+COUNTIF({match_r},"no")'])
-    summary.append(["Same decision as the LLM", f'=IFERROR(COUNTIF({match_r},"yes")/B3,"")'])
+    # "pending" is a separate outcome, not a disagreement: agreement is over included/excluded methods.
+    summary.append(["Same decision as the LLM (methods the reviewer included or excluded)",
+                    f'=IFERROR(COUNTIF({match_r},"yes")/(B3-COUNTIF({human_r},"pending")),"")'])
     summary.append(["LLM included, reviewer excluded", f'=COUNTIFS({llm_r},"include",{human_r},"exclude")'])
     summary.append(["LLM excluded, reviewer included", f'=COUNTIFS({llm_r},"exclude",{human_r},"include")'])
+    summary.append(["LLM excluded, reviewer pending (evidence needed from another paper)",
+                    f'=COUNTIFS({llm_r},"exclude",{human_r},"pending")'])
     summary.append(["Methods added by the reviewer (missed by the LLM)",
-                    f'=COUNTIFS({judge_method},"<>",{judge_decision},"include")'])
+                    f'=COUNTIFS({added_method},"<>",{added_decision},"include")'])
     summary["B4"].number_format = "0%"
-    summary.column_dimensions["A"].width = 50
+    summary.column_dimensions["A"].width = 64
 
     for cell in summary[1]:
         cell.font = Font(bold=True)
@@ -291,13 +365,13 @@ def write_screening_sheet(papers: list[dict], path: str | Path, meta: dict | Non
         info.column_dimensions["A"].width = 30
         info.column_dimensions["B"].width = 80
 
-    # Judge: the generated paper and method cells are locked; everything else, including the
+    # Judge: the LLM's paper and method cells are locked; everything else, including the
     # empty rows below for methods the LLM missed, stays editable.
-    _protect(judge, SCREEN_JUDGE_COLUMNS, SCREEN_JUDGE_COLUMNS, last + 50)
+    _protect(judge, SCREEN_JUDGE_COLUMNS, SCREEN_JUDGE_COLUMNS, editable_rows)
 
     for row in range(2, last + 1):
         for column in ("paper", "method"):
-            judge[f"{_letter(SCREEN_JUDGE_COLUMNS, column)}{row}"].protection = Protection(locked=True)
+            judge[f"{judge_col[column]}{row}"].protection = Protection(locked=True)
 
     _protect(compare, ["notes"], SCREEN_COMPARE_COLUMNS, last)
     _protect(summary, [], [], 0)

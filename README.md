@@ -50,7 +50,15 @@ Each workbook holds a random sample of quotes the pipeline found, spread over th
 2. Only when all quotes are judged, open **Compare**. It shows your relations next to the LLM's: `agreed`, `llm_only` (the LLM gave it, you didn't) and `human_only` (you gave it, the LLM didn't) fill in by themselves. For rows with an agreed relation, set `value_ok` to `yes`, `partly` or `no`: are the LLM's values for those relations right? And where `llm_only` lists relations, look again: if the LLM saw something you missed, type in `llm_only_correct` **how many** of those relations are right after all (leave it empty for 0). This gives a second set of "corrected" numbers next to the blind ones; your own marks on Judge stay as they are.
 3. **Summary** shows the agreement for this paper.
 
-**Screening** (`screening.xlsx`, same idea): the **Judge** tab has one row per method the LLM found (or `(no method found)`). Decide per method `include` or `exclude`: does it meet all criteria? If the paper describes a method that isn't listed, add a row at the bottom with the paper, the method and `include`; it counts as missed by the LLM. Then open **Compare** for the LLM's decision and its reason per criterion.
+**Screening** (`screening.xlsx`, same idea): the **Judge** tab has one row per method the LLM found (or `(no method found)`). Per method, judge each criterion **C1–C3** as `met`, `not met` or `not in this paper` (the paper gives no evidence either way; for C3, evidence of an ICT application may be in another publication), then decide:
+
+- `include`: all criteria met;
+- `exclude`: a criterion is not met;
+- `pending`: C1 and C2 are met, but the evidence for C3 has to come from another publication. The method is then decided across all papers about it, or by the team.
+
+If the paper describes a method that isn't listed, add a row at the bottom with the paper, the method and your decision; with `include` it counts as missed by the LLM. Then open **Compare** for the LLM's decision and its judgement and reason per criterion. Rebuilding a run keeps the screening judgements.
+
+The screening check only covers methods the LLM found, plus any a reviewer happens to add: it does not measure how many methods the LLM missed.
 
 When all papers of a run are reviewed, add them up (with 95% confidence intervals):
 
@@ -59,7 +67,16 @@ python evaluate.py runs/<date_time>                    # one run
 python evaluate.py runs/<baseline> runs/<improved>     # compare two runs
 ```
 
-Besides the printed scores, it writes three files to the run folder: `results.tex` (the numbers as LaTeX commands for the paper), `review_overview.md` (raw counts per paper and per relation, the screening decisions and all reviewer notes, for finding error patterns) and `scores.json`. It reports four measures: **exactly the same relations** per quote, **relation precision** (of the relations the LLM gave, how many you also gave — catches over-extraction), **relation recall** (of the relations you gave, how many the LLM also gave), and **values right**. Each is reported twice: with every paper counting equally, and **weighted** by each paper's number of quotes. They are also reported **corrected** with `llm_only_correct`: relations the LLM found and the reviewer first missed then count as right. The blind numbers are the strict ones; the corrected numbers account for reviewer misses, but were decided after seeing the LLM's answer — report both. Every paper gets the same sample size, so the weighted number is the accuracy per quote in the knowledge base (a paper with 9 methods contributes more claims than one with 1); use that one as the headline result.
+Besides the printed scores, it writes three files to the run folder: `results.tex` (the numbers as LaTeX commands for the paper), `review_overview.md` (raw counts per paper and per relation, the screening decisions and all reviewer notes, for finding error patterns) and `scores.json`. It reports four measures, each in its own unit:
+
+- **exactly the same relations**, per quote;
+- **relation precision**, per (quote, relation) pair the LLM gave: how many you also gave (catches over-extraction);
+- **relation recall**, per (quote, relation) pair you gave: how many the LLM also gave. This is recall *within the quotes the pipeline extracted*, not completeness across the paper: passages the pipeline never extracted are never reviewed;
+- **values right**, per quote with at least one agreed relation.
+
+Pairs are not claims: one pair can hold several claims (three activities named in one quote), so none of the measures is "per claim".
+
+The headline numbers are **estimates for all extracted quotes** of the reviewed papers. The sample is stratified (spread over (method, relation) groups, so rare relations are over-represented), so each sampled quote is weighted by the number of extracted quotes it stands for (inverse inclusion probability, reconstructed from `claims.jsonl` and the run's seed). Groups with no sampled quote are covered by scaling the paper's weights to its total; a warning shows how many quotes that concerns. The 95% intervals come from a bootstrap that resamples quotes within each paper. The unweighted numbers of the sample itself are printed too. All measures are also reported **corrected** with `llm_only_correct`: relations the LLM found and the reviewer first missed then count as right. The blind numbers are the strict ones; the corrected numbers account for reviewer misses, but were decided after seeing the LLM's answer, so report both.
 
 ## Changing things
 
