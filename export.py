@@ -18,7 +18,7 @@ import random
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -27,6 +27,7 @@ VALUE_OK = ["yes", "partly", "no"]
 # The Judge sheet: these columns, then one column per relation, then the review columns.
 JUDGE_COLUMNS = ["item_id", "method", "quote", "context", "page", "section"]
 SUPPORTS_NOTHING = "supports_nothing"  # x here: the quote supports no relation for this method
+SUPPORTS_NOTHING_LABEL = "(supports nothing)"  # shown in Compare for such quotes
 JUDGE_REVIEW_COLUMNS = [SUPPORTS_NOTHING, "human_value", "notes", "reviewer"]
 # The Compare sheet: these visible columns, then hidden helper columns for the formulas.
 # llm_only_correct: of the llm_only relations, how many are right after all (the reviewer missed them).
@@ -177,7 +178,35 @@ def write_review_sheet(rows: list[dict], path: str | Path, ontology: dict,
         info.column_dimensions["A"].width = 30
         info.column_dimensions["B"].width = 80
 
+    # Only the cells reviewers fill in stay editable; quotes, LLM output and formulas are locked.
+    last_row = len(items) + 1
+    _protect(judge, [labels[name] for name in relation_names] + JUDGE_REVIEW_COLUMNS, judge_headers, last_row)
+    _protect(compare, ["value_ok", "llm_only_correct", "notes"], _compare_headers(relation_names), last_row)
+
+    for sheet in (reference, summary, info if meta else None):
+        if sheet is not None:
+            _protect(sheet, [], [], 0)
+
     workbook.save(path)
+
+
+def _protect(sheet, editable: list[str], headers: list[str], last_row: int) -> None:
+    """Lock the sheet except the editable columns in rows 2..last_row.
+
+    No password: the lock prevents accidental typing over generated cells (which breaks
+    the formulas), but can be switched off on purpose (Review > Unprotect sheet).
+    """
+    for name in editable:
+        letter = _letter(headers, name)
+
+        for row in range(2, last_row + 1):
+            sheet[f"{letter}{row}"].protection = Protection(locked=False)
+
+    sheet.protection.sheet = True
+    # Still allowed on a protected sheet: resizing columns and rows, and filtering.
+    sheet.protection.formatColumns = False
+    sheet.protection.formatRows = False
+    sheet.protection.autoFilter = False
 
 
 DECISIONS = ["include", "exclude"]
@@ -262,6 +291,20 @@ def write_screening_sheet(papers: list[dict], path: str | Path, meta: dict | Non
         info.column_dimensions["A"].width = 30
         info.column_dimensions["B"].width = 80
 
+    # Judge: the generated paper and method cells are locked; everything else, including the
+    # empty rows below for methods the LLM missed, stays editable.
+    _protect(judge, SCREEN_JUDGE_COLUMNS, SCREEN_JUDGE_COLUMNS, last + 50)
+
+    for row in range(2, last + 1):
+        for column in ("paper", "method"):
+            judge[f"{_letter(SCREEN_JUDGE_COLUMNS, column)}{row}"].protection = Protection(locked=True)
+
+    _protect(compare, ["notes"], SCREEN_COMPARE_COLUMNS, last)
+    _protect(summary, [], [], 0)
+
+    if meta:
+        _protect(info, [], [], 0)
+
     workbook.save(path)
 
 
@@ -294,19 +337,25 @@ def _add_compare(sheet, items: list[dict], relation_names: list[str], judge_head
         l_range = f"{col['L_' + relation_names[0]]}{r}:{col['L_' + relation_names[-1]]}{r}"
         judged = f"{col['judged']}{r}"
 
-        def names_where(condition) -> str:
-            """A formula listing the relation names for which condition(name) holds."""
+        def names_where(condition, show_nothing: bool = False) -> str:
+            """A formula listing the relation names for which condition(name) holds.
+            With show_nothing, a judged quote without any reviewer relation shows
+            "(supports nothing)" instead of staying empty like an unjudged one."""
             parts = "&".join(f'IF({condition(name)},"{name}; ","")' for name in relation_names)
+
+            if show_nothing:
+                parts = f'IF({col["human_count"]}{r}=0,"{SUPPORTS_NOTHING_LABEL}",{parts})'
+
             return f'=IF({judged}=0,"",{parts})'
 
         values = {
             "item_id": item["item_id"],
             "quote": item["quote"],
-            "human_relations": names_where(lambda name: f"{h[name]}=1"),
+            "human_relations": names_where(lambda name: f"{h[name]}=1", show_nothing=True),
             "llm_relations": "; ".join(name for name in relation_names if name in llm),
             "agreed": names_where(lambda name: f"AND({h[name]}=1,{l[name]}=1)"),
             "llm_only": names_where(lambda name: f"AND({h[name]}=0,{l[name]}=1)"),
-            "human_only": names_where(lambda name: f"AND({h[name]}=1,{l[name]}=0)"),
+            "human_only": names_where(lambda name: f"AND({h[name]}=1,{l[name]}=0)", show_nothing=True),
             "human_value": f'=IF(Judge!{human_value}{r}="","",Judge!{human_value}{r})',
             "llm_values": "\n".join(f"{claim['relation']}: {claim['value']}" for claim in item["claims"]),
             # Judged as soon as the row has anything: an x, a value or a reviewer name.

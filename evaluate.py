@@ -22,6 +22,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from export import JUDGE_COLUMNS, JUDGE_REVIEW_COLUMNS, SUPPORTS_NOTHING, read_jsonl, relation_from_label, review_items
+from overview import write_overview
 
 
 def score_run(run_dir: Path, complete_only: bool = False) -> dict:
@@ -463,10 +464,12 @@ def main() -> None:
         result = score_run(run_dir, args.complete_only)
         (run_dir / "scores.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         write_latex(result, run_dir / "results.tex")
+        write_overview(run_dir, run_dir / "review_overview.md")
         scores.append(result)
 
     print_scores(scores)
-    print("\nLaTeX numbers written to " + ", ".join(str(run_dir / "results.tex") for run_dir in args.run_dirs))
+    for run_dir in args.run_dirs:
+        print(f"\nWritten to {run_dir}: results.tex (LaTeX numbers), review_overview.md (raw counts and notes), scores.json")
 
 
 if __name__ == "__main__":
