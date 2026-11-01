@@ -12,7 +12,7 @@ Extract everything this paper states about the method "{method}", using the onto
 
 - Only use what this paper states. Do not add knowledge about the method from elsewhere.
 - Only extract claims about "{method}". This paper also discusses: {other_methods}. Passages about those methods, or about general approaches "{method}" is compared with or builds on, are not claims about "{method}", even when they appear in a section about it.
-- Give a relation for a quote only if the quote itself states it. Do not add relations that only follow by inference from the quote's main point: for example, people mentioned in a sentence about a step are not thereby participants or stakeholders.
+- Give a relation for a quote only if the quote itself states it. Do not add relations that only follow by inference from the quote's main point: for example, people mentioned in a sentence about a step are not thereby participants or stakeholders. This is about which relations you give, not about the quote's length: the quote is still one or two complete sentences, never cut down to the words that state the relation.
 - Read negations and contrasts carefully. A sentence saying that something is lacking, not needed, or not affected does not support a claim that the method requires or addresses it.
 - If the paper does not mention a relation, mark it "not_reported". Do not guess or infer to fill it.
 - Give one claim per distinct value. If the paper names three activities, give three claims. If several passages support the same value, give a claim for each passage.
