@@ -495,7 +495,9 @@ def _add_summary(sheet, relation_names: list[str], item_count: int, labels: dict
     sheet.append(["Relation recall (reviewer's relations the LLM also found)",
                   f'=IFERROR(SUMPRODUCT({judged},{agreed})/SUMPRODUCT({judged},{human_count}),"")'])
     sheet.append(["Values right (quotes with at least one agreed relation)",
-                  f'=IFERROR(COUNTIF({value_ok},"yes")/COUNTIFS({agreed},">0",{judged},1),"")'])
+                  # Only rows with an agreed relation and a filled-in value_ok, as in evaluate.py.
+                  f'=IFERROR(COUNTIFS({value_ok},"yes",{agreed},">0",{judged},1)'
+                  f'/COUNTIFS({value_ok},"<>",{agreed},">0",{judged},1),"")'])
     sheet.append(["Reviewer: quote supports nothing about the method",
                   f'=IFERROR(COUNTIFS({judged},1,{human_count},0)/B3,"")'])
     # Rows 9-13: corrected with llm_only_correct, for relations the LLM found and the reviewer missed.
