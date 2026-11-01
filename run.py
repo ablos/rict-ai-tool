@@ -5,6 +5,7 @@
     python run.py papers/dev/paper.pdf --method "Value Sensitive Design"
     python run.py --rebuild runs/2026-10-11_153000  # redo verify + export, no API calls
     python run.py --retry-failed runs/2026-10-11_153000  # redo only the papers that failed
+    python run.py papers/dev/*.pdf --methods-from runs/2026-10-11_153000  # same methods, no screening
 
 Each run gets its own folder under runs/ containing:
     meta.json        what was run: inputs, ontology, prompts, models, settings, timings
@@ -55,6 +56,9 @@ def main() -> None:
                         help=f"PDF files to process; default: all PDFs in {DEV_PAPERS}/ (or {HELDOUT_PAPERS}/ with --final)")
     parser.add_argument("--method", action="append", default=[],
                         help="method to extract, for every PDF (repeat for several); default: the model identifies them")
+    parser.add_argument("--methods-from", type=Path, metavar="RUN_DIR",
+                        help="skip screening and extract the methods an earlier run included for each paper "
+                             "(papers are matched on their content, so renamed PDFs still match)")
     parser.add_argument("--workers", type=int, default=3, help="number of papers processed at the same time")
     parser.add_argument("--final", action="store_true", help="allow held-out papers (final evaluation only)")
     parser.add_argument("--rebuild", type=Path, metavar="RUN_DIR",
@@ -89,10 +93,27 @@ def main() -> None:
     if missing:
         sys.exit("Not found: " + ", ".join(map(str, missing)))
 
+    if args.method and args.methods_from:
+        sys.exit("Use either --method or --methods-from, not both.")
+
     check_heldout(args.pdfs, args.final)
     review = {"sample_per_paper": REVIEW_SAMPLE if args.sample is None else args.sample,
               "seed": REVIEW_SEED if args.seed is None else args.seed}
-    run(args.pdfs, args.method, args.workers, args.final, review)
+    run(args.pdfs, args.method, args.workers, args.final, review, args.methods_from)
+
+
+def load_methods_from(run_dir: Path | None) -> dict[str, dict]:
+    """The papers of an earlier run, by PDF sha256, for --methods-from (empty if not given)."""
+    if run_dir is None:
+        return {}
+
+    meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    papers = {paper["sha256"]: paper for paper in meta["papers"] if paper["sha256"] and not paper["error"]}
+
+    if not papers:
+        sys.exit(f"No successfully processed papers in {run_dir}")
+
+    return papers
 
 
 def check_heldout(pdfs: list[Path], final: bool) -> None:
@@ -103,7 +124,9 @@ def check_heldout(pdfs: list[Path], final: bool) -> None:
         sys.exit("Refusing to run on held-out papers without --final:\n" + "\n".join(f"  {pdf}" for pdf in heldout))
 
 
-def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review: dict) -> None:
+def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review: dict,
+        methods_from: Path | None = None) -> None:
+    previous = load_methods_from(methods_from)
     load_dotenv()
     client = Mistral(api_key=os.environ["MISTRAL_API_KEY"], retry_config=RETRIES)
     ontology = load_ontology(ONTOLOGY_PATH)
@@ -119,6 +142,7 @@ def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review:
         **settings(ontology),
         "mistralai_version": version("mistralai"),
         "methods_given": methods,
+        "methods_from": str(methods_from) if methods_from else None,
         "review": review,
         "papers": [],
     }
@@ -128,7 +152,7 @@ def run(pdfs: list[Path], methods: list[str], workers: int, final: bool, review:
     lock = Lock()  # papers run in parallel threads, but share one extracted.jsonl
 
     def process(pdf: Path) -> tuple[dict, list[dict]]:
-        return process_paper(client, pdf, methods, ontology, raw_file, lock)
+        return process_paper(client, pdf, methods, ontology, raw_file, lock, previous)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(process, pdfs))  # map() returns results in input order
@@ -178,6 +202,7 @@ def retry_failed(run_dir: Path, workers: int) -> None:
     raw_file = run_dir / "extracted.jsonl"
     write_jsonl([row for row in read_jsonl(raw_file) if row["pdf_sha256"] not in failed_shas], raw_file)
 
+    previous = load_methods_from(Path(meta["methods_from"]) if meta.get("methods_from") else None)
     load_dotenv()
     client = Mistral(api_key=os.environ["MISTRAL_API_KEY"], retry_config=RETRIES)
     lock = Lock()
@@ -185,7 +210,7 @@ def retry_failed(run_dir: Path, workers: int) -> None:
 
     def process(index: int) -> tuple[dict, list[dict]]:
         pdf = Path(meta["papers"][index]["pdf"])
-        return process_paper(client, pdf, meta["methods_given"], ontology, raw_file, lock)
+        return process_paper(client, pdf, meta["methods_given"], ontology, raw_file, lock, previous)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(process, failed))
@@ -203,9 +228,13 @@ def retry_failed(run_dir: Path, workers: int) -> None:
 
 
 def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict,
-                  raw_file: Path, lock: Lock) -> tuple[dict, list[dict]]:
+                  raw_file: Path, lock: Lock, previous: dict[str, dict] | None = None) -> tuple[dict, list[dict]]:
     """OCR, extraction and verification for one PDF. Errors are recorded, not raised,
-    so one bad paper does not stop the others."""
+    so one bad paper does not stop the others.
+
+    previous: papers of an earlier run by sha256 (--methods-from); if given, the paper is not
+    screened again and the methods that run included are extracted.
+    """
     started = time.time()
     paper = {"pdf": str(pdf), "sha256": None, "pages": None, "ocr_model": None,
              "screening": None, "methods": [], "error": None}
@@ -216,11 +245,26 @@ def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict
         paper.update(sha256=ocr["sha256"], pages=len(ocr["pages"]), ocr_model=ocr["model"])
         print(f"{pdf.name}: OCR ready ({len(ocr['pages'])} pages)")
 
+        # Every method found in the paper; the extraction prompt names the others, so that
+        # passages about them are not attributed to the method being extracted.
+        candidates = methods
+
         if methods:
             paper["methods"] = methods  # chosen by hand, so the paper is not screened
+        elif previous:
+            if ocr["sha256"] not in previous:
+                raise ValueError("paper not in the --methods-from run (or it failed there)")
+
+            earlier = previous[ocr["sha256"]]
+            paper["methods"] = earlier["methods"]
+            # Not stored as "screening": this run did not screen, so it gets no screening sheet.
+            paper["methods_from_screening"] = earlier["screening"]
+            candidates = [c["name"] for c in earlier["screening"] or []] or earlier["methods"]
+            print(f"{pdf.name}: methods from earlier run: {', '.join(paper['methods']) or 'none'}")
         else:
             paper["screening"] = extract.screen_methods(client, ocr, ontology)
             paper["methods"] = [candidate["name"] for candidate in paper["screening"] if candidate["included"]]
+            candidates = [candidate["name"] for candidate in paper["screening"]]
 
             for candidate in paper["screening"]:
                 failed = [criterion for criterion, check in candidate["criteria"].items() if not check["met"]]
@@ -231,7 +275,7 @@ def process_paper(client: Mistral, pdf: Path, methods: list[str], ontology: dict
                 print(f"{pdf.name}: paper rejected, no method meets the criteria")
 
         for method in paper["methods"]:
-            method_rows = extract.extract_claims(client, ocr, method, ontology)
+            method_rows = extract.extract_claims(client, ocr, method, ontology, candidates)
             
             for row in method_rows:
                 # Unique within a run, and the same again after --rebuild.

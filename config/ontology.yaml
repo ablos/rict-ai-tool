@@ -23,7 +23,7 @@
 #
 #   Lines marked "OPEN:" are unresolved ontology issues.
 
-version: "0.4"
+version: "0.5"  # round 2: sharper definitions after the round-1 error analysis
 
 subject:
   label: Method
@@ -49,6 +49,9 @@ concepts:
       The kind of ethical or sustainability issue the method deals with. This is a
       type of issue (such as a conflict between values), not a single value:
       individual values such as privacy belong under Ethical or Sustainability Value.
+      The issue must be presented as what the method deals with: a general problem
+      the paper discusses (for example in its motivation) only counts if the paper
+      links it to the method.
     examples: [value conflict, environmental impact, social sustainability impact, unintended consequences]
     questions: [Q1, Q5, Q6, Q15]
     relations:
@@ -73,7 +76,11 @@ concepts:
 
   - id: lifecycle_stage
     label: Lifecycle stage
-    definition: The phase of an ICT system's life in which the method is applied.
+    definition: >-
+      A stage in the life of the ICT system the method is applied to, such as
+      concept, requirements, design, deployment or evaluation. Not a phase, stage or
+      iteration of the method itself (those are Activities), and not what a method or
+      paper focuses on, unless the paper says the method is used in that stage.
     examples: [concept (not yet built), requirements, design, deployment, evaluation]
     questions: [Q2, Q7, Q14]
     relations:
@@ -82,7 +89,11 @@ concepts:
 
   - id: stakeholder
     label: Stakeholder
-    definition: A person or group whose values or interests the method takes into account.
+    definition: >-
+      A person or group whose values or interests the method takes into account. Not
+      the people who carry out the method (those are participants, under Resource
+      Requirement), and not people who are only mentioned, such as the readers of the
+      paper or the people in an example.
     examples: [patients, clinicians, developers, society]
     questions: [Q3, Q8]
     relations:
@@ -95,6 +106,8 @@ concepts:
       A step the method prescribes: something people do while carrying out the
       method. Tools, forms, question lists and other artefacts used in a step are
       materials (Resource Requirement), and what a step results in is an Output.
+      A sentence that names a step is an Activity, also when it states the step's aim
+      or result as well; give those too, under Purpose or Output.
     examples: [stakeholder identification, value elicitation, scenario writing]
     questions: [Q10]
     relations:
@@ -112,12 +125,18 @@ concepts:
 
   - id: input
     label: Input
-    definition: Information or an artefact the method needs before it can start.
+    definition: >-
+      Information or an artefact that must already exist before the method starts,
+      such as a system description or a technology concept. Never a step of the
+      method: anything the method has people do, including its first step, is an
+      Activity.
     examples: [system description, requirements document, technology concept]
     questions: [Q19]
     relations:
       - name: startsWith
-        definition: The method needs this information or artefact before it can start.
+        definition: >-
+          The method needs this information or artefact to exist before it can start;
+          it is not something the method itself does or produces.
 
   # One concept; the relation names the kind of requirement (replaces the former
   # Participants, Materials, Expertise and Property/Duration concepts).
@@ -131,13 +150,17 @@ concepts:
         definition: >-
           A person or role that takes part in carrying out the method, such as a
           facilitator or interviewees. Not everyone whose values are considered
-          (that is Stakeholder), and not the intended audience of the publication.
+          (that is Stakeholder), not the intended audience of the publication, and
+          not people in an example or a single application.
         examples: [facilitator, development team, ethicist, end users]
       - name: requiresMaterials
         definition: A tool or artefact used while carrying out the method.
         examples: [template, canvas, software tool]
       - name: requiresExpertise
-        definition: Knowledge or skills needed to apply the method.
+        definition: >-
+          Knowledge or skills needed to apply the method. Always knowledge or skills,
+          never people or methods: "experts in ethics" are participants; a method used
+          within it is an Activity or a material.
         examples: [ethics knowledge, facilitation skills, domain knowledge]
       - name: hasDuration
         definition: How long the method (or a session of it) takes to carry out.
@@ -178,7 +201,11 @@ concepts:
   # publication recorded on every claim, so it needs no relation of its own.
   - id: application_case
     label: Application case
-    definition: A specific ICT project or study in which a method has been applied.
+    definition: >-
+      A specific ICT project or study in which a method has been applied. Only
+      applications that the paper reports as actually carried out: examples ("for
+      instance…"), hypothetical situations, and problems or systems used to illustrate
+      a point are not application cases.
     examples: [application of VSD in healthcare AI, application of Ethical Matrix in autonomous systems]
     questions: [Q22]  # Q23 (recommendation: future work) and Q24 (covered by Q16) dropped
     relations:

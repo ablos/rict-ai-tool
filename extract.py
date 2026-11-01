@@ -80,9 +80,16 @@ def screen_methods(client: Mistral, ocr: dict, ontology: dict) -> list[dict]:
 
     return candidates
 
-def extract_claims(client: Mistral, ocr: dict, method: str, ontology: dict) -> list[dict]:
-    """One row per claim, plus one row for each relation without claims."""
-    system = load_prompt("extract").format(method=method, ontology=describe_ontology(ontology))
+def extract_claims(client: Mistral, ocr: dict, method: str, ontology: dict,
+                   other_methods: list[str] = ()) -> list[dict]:
+    """One row per claim, plus one row for each relation without claims.
+
+    other_methods: the other methods screening found in this paper, named in the prompt so
+    that passages about them are not attributed to this method.
+    """
+    others = "; ".join(f'"{name}"' for name in other_methods if name != method) or "no other methods"
+    system = load_prompt("extract").format(method=method, ontology=describe_ontology(ontology),
+                                           other_methods=others)
     answer = _ask(client, system, ocr, build_output_model(ontology))
 
     rows = []
