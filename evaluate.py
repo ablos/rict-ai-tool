@@ -1,7 +1,8 @@
 """Add up the reviewed workbooks of one or more runs into an accuracy estimate.
 
     python evaluate.py runs/2026-10-17_101500                         # one run
-    python evaluate.py runs/2026-10-17_101500 runs/2026-10-20_143000  # compare two runs
+    python evaluate.py runs/2026-10-17_101500 runs/2026-10-20_143000  # compare two runs (round 1, round 2)
+    python evaluate.py ... --weighted  # also estimate for all extracted quotes (weights, bootstrap)
 
 Reads every review_*.xlsx (and screening.xlsx, if present) in each run folder,
 compares the reviewers' relations per quote (Judge sheet) with the LLM's (Compare
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from export import (JUDGE_COLUMNS, JUDGE_REVIEW_COLUMNS, SUPPORTS_NOTHING, read_jsonl, relation_from_label,
+from export import (JUDGE_COLUMNS, JUDGE_REVIEW_COLUMNS, NO_METHOD_FOUND, SUPPORTS_NOTHING, read_jsonl, relation_from_label,
                     review_items, sample_items)
 from overview import write_overview
 
@@ -49,9 +50,11 @@ BOOTSTRAP_SAMPLES = 2000
 BOOTSTRAP_SEED = 0
 
 
-def score_run(run_dir: Path, complete_only: bool = False) -> dict:
+def score_run(run_dir: Path, complete_only: bool = False, weighted: bool = False) -> dict:
     """Agreement between reviewers and LLM for all review workbooks in a run folder.
     With complete_only, papers with quotes not judged yet are left out entirely.
+    The results describe the reviewed sample; with weighted, estimates for all extracted
+    quotes (sampling-design weights, bootstrap intervals) are added as well.
 
     Per quote, the reviewer's set of relations is compared with the LLM's:
         exact       both sets are the same
@@ -80,7 +83,9 @@ def score_run(run_dir: Path, complete_only: bool = False) -> dict:
         weights, design = sampling_weights([row for row in rows if row["publication"] == publications.get(path.name)],
                                            [(row["item_id"], row["quote"]) for row in judge_rows], review)
 
-        if not design["matched"]:
+        if not weighted:
+            pass  # the weights are only used for the --weighted estimates
+        elif not design["matched"]:
             warnings.append(f"{path.name}: the sample could not be reconstructed from claims.jsonl; "
                             "equal weights used within this paper")
         elif design["coverage"] < 1:
@@ -158,8 +163,12 @@ def score_run(run_dir: Path, complete_only: bool = False) -> dict:
             per_relation[name] += counts
 
     total = _with_rates(totals)
-    # Estimates for all extracted quotes of the reviewed papers, from the sample.
-    total["estimate"] = design_estimates({name: records[name] for name in per_paper})
+    # The sample itself: every measure as numerator / denominator over the reviewed quotes.
+    total["sample"] = {name: {"rate": _ratio(totals[num], totals[den]), "num": totals[num], "den": totals[den],
+                              "unit": unit}
+                       for name, (num, den, unit) in MEASURES.items()}
+    # Estimates for all extracted quotes of the reviewed papers, from the sample (only with --weighted).
+    total["estimate"] = design_estimates({name: records[name] for name in per_paper}) if weighted else None
     per_relation = {
         name: {**counts, "precision": _ratio(counts["both"], counts["llm"]), "recall": _ratio(counts["both"], counts["human"])}
         for name, counts in per_relation.items()
@@ -173,6 +182,26 @@ def score_run(run_dir: Path, complete_only: bool = False) -> dict:
         "screening": score_screening(run_dir / "screening.xlsx", warnings),
         "warnings": warnings,
     }
+
+
+def reference_decision(c1, c2, c3) -> str | None:
+    """The reference decision for a method, derived from the reviewer's judgement of C1-C3
+    (met / not met / not in this paper); None when not all three are judged.
+
+        any criterion not met                          exclude
+        C1 or C2 not in this paper                     exclude: the paper does not describe the
+                                                       method well enough to extract it
+        all met                                        include
+        C1 and C2 met, C3 not in this paper            pending: the ICT application has to come
+                                                       from another publication
+    """
+    judgements = [str(value or "").strip() for value in (c1, c2, c3)]
+
+    if not all(judgements):
+        return None
+    if "not met" in judgements or "not in this paper" in judgements[:2]:
+        return "exclude"
+    return "include" if judgements[2] == "met" else "pending"
 
 
 def score_screening(path: Path, warnings: list[str]) -> dict | None:
@@ -194,8 +223,15 @@ def score_screening(path: Path, warnings: list[str]) -> dict | None:
         papers[paper]["llm"] |= row["llm_decision"] == "include"
 
     for row in _rows(workbook["Judge"]):
-        human = str(row.get("human_decision") or "").strip()
+        # The reference decision follows from the reviewer's criterion judgements (reference_decision);
+        # only rows without criteria, such as "(no method found)", keep the reviewer's typed decision.
+        human = reference_decision(*(row.get(criterion) for criterion in ("C1", "C2", "C3"))) \
+            or str(row.get("human_decision") or "").strip()
         key = (row["paper"], row["method"])
+        typed = str(row.get("human_decision") or "").strip()
+
+        if typed and human != typed:
+            methods["decision_derived_differs"] += 1
 
         if not human:
             methods["not_judged"] += 1
@@ -206,6 +242,12 @@ def score_screening(path: Path, warnings: list[str]) -> dict | None:
 
         if key not in llm:  # added by the reviewer
             methods["missed_by_llm"] += human == "include"
+            continue
+
+        # A paper without candidate methods is a paper-level result, not a method.
+        if row["method"] == NO_METHOD_FOUND:
+            methods["papers_without_candidates"] += 1
+            methods["papers_without_candidates_human_include"] += human == "include"
             continue
 
         llm_decision = llm[key]["llm_decision"]
@@ -402,8 +444,6 @@ def print_scores(scores: list[dict]) -> None:
                        ("human_none", "Reviewer: quote supports nothing")]:
         print(f"{label:<{width}}" + "".join(f"{s['total'].get(key, 0):>{column}}" for s in scores))
 
-    print("\nEstimates for all extracted quotes of the reviewed papers "
-          "(weighted by sampling design, 95% bootstrap interval):")
     sections = [
         ("Blind", [("exact", "Exactly the same relations"), ("precision", "Relation precision"),
                    ("recall", "Relation recall (within extracted quotes)"),
@@ -416,19 +456,32 @@ def print_scores(scores: list[dict]) -> None:
           ("precision_corrected", "Relation precision"), ("recall_corrected", "Relation recall (within extracted quotes)")]),
     ]
 
+    def sample_cell(s: dict, key: str) -> str:
+        m = s["total"]["sample"][key]
+        return "-" if not m["den"] else f"{_whole_percent(m['num'], m['den'])}% ({m['num']}/{m['den']})"
+
+    print("\nIn the reviewed sample (descriptive, unweighted):")
+
     for title, measures in sections:
         print(f"  {title}:")
 
         for key, label in measures:
-            print(f"    {label:<{width - 4}}" + "".join(f"{_rate(s['total']['estimate'].get(key)):>{column}}" for s in scores))
+            print(f"    {label:<{width - 4}}" + "".join(f"{sample_cell(s, key):>{column}}" for s in scores))
 
     print("\n  Units: " + "; ".join(f"{name} per {MEASURES[name][2]}" for name in ("exact", "precision", "recall", "values")))
+    print("  Values: " + "".join(f"{s['total'].get('value_yes', 0)} yes / {s['total'].get('value_partly', 0)} partly / "
+                                 f"{s['total'].get('value_no', 0)} no   " for s in scores))
 
-    print("\nIn the sample itself (unweighted, 95% Wilson interval; precision and recall approximate):")
+    if any(s["total"]["estimate"] for s in scores):
+        print("\nEstimates for all extracted quotes of the reviewed papers "
+              "(--weighted: sampling-design weights, 95% bootstrap interval):")
 
-    for key, label in [("exact_rate", "Exactly the same relations"), ("precision", "Relation precision"),
-                       ("recall", "Relation recall (within extracted quotes)"), ("values", "Values right")]:
-        print(f"  {label:<{width - 2}}" + "".join(f"{_rate(s['total'].get(key)):>{column}}" for s in scores))
+        for title, measures in sections:
+            print(f"  {title}:")
+
+            for key, label in measures:
+                print(f"    {label:<{width - 4}}" + "".join(
+                    f"{_rate((s['total']['estimate'] or {}).get(key)):>{column}}" for s in scores))
 
     print(f"\nPer relation (blind, not corrected): precision / recall (times the LLM chose it)")
     relations = dict.fromkeys(relation for s in scores for relation in s["per_relation"])
@@ -460,8 +513,14 @@ def print_scores(scores: list[dict]) -> None:
                 print(f"  {label:<{width - 2}}" + "".join(
                     f"{s['screening'][level].get(key, 0) if s['screening'] else '-':>{column}}" for s in scores))
 
-            print(f"  {'Same decision (95% CI)':<{width - 2}}" + "".join(
-                f"{_rate(s['screening'][level]['same_decision_rate']) if s['screening'] else '-':>{column}}" for s in scores))
+            def same(s: dict) -> str:
+                if not s["screening"]:
+                    return "-"
+                counts = s["screening"][level]
+                base = counts.get("decided", counts.get("judged", 0)) if level == "per_method" else counts.get("judged", 0)
+                return f"{counts.get('same_decision', 0)}/{base}"
+
+            print(f"  {'Same decision':<{width - 2}}" + "".join(f"{same(s):>{column}}" for s in scores))
 
         print("\nScreening per criterion (same judgement where both say met / not met)")
 
@@ -471,7 +530,7 @@ def print_scores(scores: list[dict]) -> None:
             for s in scores:
                 counts = (s["screening"] or {}).get("per_criterion", {}).get(criterion)
                 cells.append("-" if not counts else
-                             f"{_rate(counts['same_rate'])} n={counts.get('judged', 0)}, "
+                             f"same {counts.get('same', 0)}/{counts.get('judged', 0)}, "
                              f"not in paper {counts.get('not_in_paper', 0)}")
 
             print(f"  {criterion:<{width - 2}}" + "".join(f"{cell:>{column + 14}}" for cell in cells))
@@ -481,11 +540,41 @@ def print_scores(scores: list[dict]) -> None:
             print(f"\nWarning ({Path(s['run']).name}): {warning}")
 
 
-def write_latex(score: dict, path: Path) -> None:
+# The measures written to LaTeX, with their macro names and labels for the comparison table.
+LATEX_MEASURES = [
+    ("exact", "Exact", "Exact agreement"),
+    ("supports_nothing", "SupportsNothing", "Quote supports nothing"),
+    ("precision", "Precision", "Relation precision"),
+    ("recall", "Recall", "Relation recall (within extracted quotes)"),
+    ("values", "Values", "Value correctness"),
+    ("llm_only_right", "LlmOnlyRight", "Pipeline-only relations accepted"),
+    ("exact_corrected", "ExactCorrected", "Exact agreement, corrected"),
+    ("precision_corrected", "PrecisionCorrected", "Relation precision, corrected"),
+    ("recall_corrected", "RecallCorrected", "Relation recall, corrected"),
+]
+# Macro prefixes when several runs are evaluated together (LaTeX names cannot contain digits).
+ROUND_PREFIXES = ["ResOne", "ResTwo", "ResThree", "ResFour"]
+
+
+def _whole_percent(numerator: int, denominator: int) -> int:
+    """Percentage rounded half up, computed exactly (39/120 = 32.5% gives 33, not 32)."""
+    return (200 * numerator + denominator) // (2 * denominator)
+
+
+def _percent_count(measure: dict) -> tuple[str, str]:
+    """A sample measure as LaTeX: ("54\\%", "89/166")."""
+    if not measure["den"]:
+        return "--", "--"
+    return f"{_whole_percent(measure['num'], measure['den'])}\\%", f"{measure['num']}/{measure['den']}"
+
+
+def write_latex(score: dict, path: Path, prefix: str = "Res") -> None:
     """The headline numbers as LaTeX commands, plus a table per paper, for the paper.
 
-    \\input{results.tex} in the paper and write e.g. "precision was \\ResPrecision{}";
-    re-running evaluate.py then updates every number in the paper.
+    \\input{results.tex} in the paper and write e.g. "precision was \\ResPrecision{}
+    (\\ResPrecisionN{})", which gives "54% (89/166)"; re-running evaluate.py then updates
+    every number in the paper. The numbers describe the reviewed sample; the weighted
+    estimates are only added (as \\ResWeighted...) when evaluate.py ran with --weighted.
     """
     total, estimate = score["total"], score["total"]["estimate"]
 
@@ -500,32 +589,55 @@ def write_latex(score: dict, path: Path) -> None:
 
     commands = {
         # Counts
-        "ResPapers": str(len(score["per_paper"])),
-        "ResPapersCompared": str(sum(1 for paper in score["per_paper"].values() if paper.get("compared"))),
-        "ResQuotes": str(total.get("judged", 0)),
-        "ResQuotesCompared": str(total.get("compared", 0)),
-        "ResPairsLlm": str(total.get("llm_pairs", 0)),
-        "ResPairsHuman": str(total.get("human_pairs", 0)),
-        "ResPairsAgreed": str(total.get("agreed_pairs", 0)),
-        "ResQuotesInPapers": str(sum(paper.get("quotes_in_paper", 0) for paper in score["per_paper"].values())),
+        "Papers": str(len(score["per_paper"])),
+        "PapersCompared": str(sum(1 for paper in score["per_paper"].values() if paper.get("compared"))),
+        "Quotes": str(total.get("judged", 0)),
+        "QuotesCompared": str(total.get("compared", 0)),
+        "PairsLlm": str(total.get("llm_pairs", 0)),
+        "PairsHuman": str(total.get("human_pairs", 0)),
+        "PairsAgreed": str(total.get("agreed_pairs", 0)),
+        "QuotesInPapers": str(sum(paper.get("quotes_in_paper", 0) for paper in score["per_paper"].values())),
+        "ValuesYes": str(total.get("value_yes", 0)),
+        "ValuesPartly": str(total.get("value_partly", 0)),
+        "ValuesWrong": str(total.get("value_no", 0)),
     }
 
-    # Estimates for all extracted quotes (sampling-design weights), each with its 95% bootstrap interval:
-    # \ResPrecision{} and \ResPrecisionCI{}, \ResExactCorrected{} and \ResExactCorrectedCI{}, ...
-    for key, name in [("exact", "Exact"), ("precision", "Precision"), ("recall", "Recall"), ("values", "Values"),
-                      ("supports_nothing", "SupportsNothing"), ("exact_compared", "ExactCompared"),
-                      ("precision_compared", "PrecisionCompared"), ("recall_compared", "RecallCompared"),
-                      ("llm_only_right", "LlmOnlyRight"), ("exact_corrected", "ExactCorrected"),
-                      ("precision_corrected", "PrecisionCorrected"), ("recall_corrected", "RecallCorrected")]:
-        commands[f"Res{name}"] = percent(estimate.get(key))
-        commands[f"Res{name}CI"] = interval(estimate.get(key))
+    # The sample (descriptive): \ResPrecision{} = "54\%" and \ResPrecisionN{} = "89/166", ...
+    for key, name, _ in LATEX_MEASURES:
+        commands[name], commands[f"{name}N"] = _percent_count(total["sample"][key])
+
+    # Only with --weighted: estimates for all extracted quotes with their 95% bootstrap interval.
+    if estimate:
+        for key, name, _ in LATEX_MEASURES:
+            commands[f"Weighted{name}"] = percent(estimate.get(key))
+            commands[f"Weighted{name}CI"] = interval(estimate.get(key))
+
+    # Screening per method and per criterion (counts), if the run has a screening sheet.
+    screening = score.get("screening")
+    if screening:
+        methods = screening["per_method"]
+        commands.update({
+            "ScreenMethodsJudged": str(methods.get("judged", 0)),
+            "ScreenMethodsDecided": str(methods.get("decided", 0)),
+            "ScreenMethodsSame": str(methods.get("same_decision", 0)),
+            "ScreenLlmInclHumanExcl": str(methods.get("llm_include_human_exclude", 0)),
+            "ScreenLlmExclHumanIncl": str(methods.get("llm_exclude_human_include", 0)),
+            "ScreenPending": str(methods.get("pending", 0)),
+            "ScreenPendingLlmExcl": str(methods.get("llm_exclude_human_pending", 0)),
+            "ScreenPapersWithoutCandidates": str(methods.get("papers_without_candidates", 0)),
+        })
+        for criterion, word in (("C1", "One"), ("C2", "Two"), ("C3", "Three")):
+            counts = screening["per_criterion"].get(criterion, {})
+            commands[f"ScreenC{word}Same"] = str(counts.get("same", 0))
+            commands[f"ScreenC{word}Judged"] = str(counts.get("judged", 0))
+            commands[f"ScreenC{word}NotInPaper"] = str(counts.get("not_in_paper", 0))
 
     lines = ["% Generated by evaluate.py from " + score["run"] + " -- do not edit by hand."]
-    lines += [f"\\newcommand{{\\{name}}}{{{value}}}" for name, value in commands.items()]
+    lines += [f"\\newcommand{{\\{prefix}{name}}}{{{value}}}" for name, value in commands.items()]
     # Per paper: the sample itself, unweighted (rates over the sampled quotes and their pairs).
     lines += [
         "",
-        "\\newcommand{\\ResPaperTable}{%",
+        f"\\newcommand{{\\{prefix}PaperTable}}{{%",
         "\\begin{tabular}{lrrrrrrr}",
         "\\hline",
         "Publication & Extracted & Sampled & Exact & Precision & Recall & Values & Corr.\\ precision \\\\",
@@ -545,27 +657,65 @@ def write_latex(score: dict, path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def comparison_latex(scores: list[dict]) -> str:
+    """\\ResComparisonTable: every measure per round, as "54\\% (89/166)"."""
+    lines = ["% Comparison of the evaluated runs, in the order given to evaluate.py.",
+             "\\newcommand{\\ResComparisonTable}{%",
+             "\\begin{tabular}{l" + "r" * len(scores) + "}",
+             "\\hline",
+             "Measure & " + " & ".join(f"Round {i + 1}" for i in range(len(scores))) + " \\\\",
+             "\\hline"]
+
+    for key, _, label in LATEX_MEASURES:
+        cells = []
+        for score in scores:
+            rate, count = _percent_count(score["total"]["sample"][key])
+            cells.append("--" if rate == "--" else f"{rate} ({count})")
+        lines.append(f"{label} & " + " & ".join(cells) + " \\\\")
+
+    lines += ["\\hline", "\\end{tabular}}", ""]
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run_dirs", nargs="+", type=Path, help="run folders with reviewed workbooks")
     parser.add_argument("--complete-only", action="store_true",
                         help="leave out papers whose review is not finished")
+    parser.add_argument("--weighted", action="store_true",
+                        help="also estimate the results for all extracted quotes (sampling-design weights, "
+                             "bootstrap intervals); by default the reviewed sample is reported descriptively")
     args = parser.parse_args()
     scores = []
+
+    if len(args.run_dirs) > len(ROUND_PREFIXES):
+        sys.exit(f"At most {len(ROUND_PREFIXES)} runs at once")
+
+    # One run: macros \Res...; several: \ResOne..., \ResTwo..., so the paper can \input all of them.
+    prefixes = ["Res"] if len(args.run_dirs) == 1 else ROUND_PREFIXES[:len(args.run_dirs)]
 
     for run_dir in args.run_dirs:
         if not list(run_dir.glob("review_*.xlsx")) and not (run_dir / "screening.xlsx").exists():
             sys.exit(f"No review_*.xlsx or screening.xlsx in {run_dir}")
 
-        result = score_run(run_dir, args.complete_only)
+        scores.append(score_run(run_dir, args.complete_only, args.weighted))
+
+    for run_dir, result, prefix in zip(args.run_dirs, scores, prefixes):
         (run_dir / "scores.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        write_latex(result, run_dir / "results.tex")
+        write_latex(result, run_dir / "results.tex", prefix)
         write_overview(run_dir, run_dir / "review_overview.md")
-        scores.append(result)
+
+    # The comparison table goes into the last run's results.tex.
+    if len(scores) > 1:
+        with open(args.run_dirs[-1] / "results.tex", "a", encoding="utf-8") as file:
+            file.write("\n" + comparison_latex(scores))
 
     print_scores(scores)
-    for run_dir in args.run_dirs:
-        print(f"\nWritten to {run_dir}: results.tex (LaTeX numbers), review_overview.md (raw counts and notes), scores.json")
+    for run_dir, prefix in zip(args.run_dirs, prefixes):
+        print(f"\nWritten to {run_dir}: results.tex (LaTeX macros \\{prefix}...), "
+              "review_overview.md (raw counts and notes), scores.json")
+    if len(scores) > 1:
+        print(f"Comparison table \\ResComparisonTable: in {args.run_dirs[-1] / 'results.tex'}")
 
 
 if __name__ == "__main__":
