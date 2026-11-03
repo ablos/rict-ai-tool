@@ -26,7 +26,10 @@ Run from the project root:
 python run.py                                                        # every PDF in papers/dev/
 python run.py --final                                                # every PDF in papers/heldout/
 python run.py papers/dev/paper.pdf --method "Value Sensitive Design"   # one paper, method given
+python run.py papers/dev/*.pdf --methods-from runs/<date_time>          # same methods as an earlier run, no screening
 ```
+
+`--methods-from` reuses the methods an earlier run included per paper (matched on file content, so renamed PDFs still match). It was used for round 2, so that both rounds extract the same methods and only the revised definitions and instructions differ.
 
 Without `--method`, the model first **screens** each paper: it lists the methods it describes and checks each against the inclusion criteria (C1–C3 in `config/ontology.yaml`). Only methods that meet all criteria are extracted; a paper without one is rejected. With `--method`, screening is skipped.
 
@@ -53,21 +56,24 @@ Each workbook holds a random sample of quotes the pipeline found, spread over th
 **Screening** (`screening.xlsx`, same idea): the **Judge** tab has one row per method the LLM found (or `(no method found)`). Per method, judge each criterion **C1–C3** as `met`, `not met` or `not in this paper` (the paper gives no evidence either way; for C3, evidence of an ICT application may be in another publication), then decide:
 
 - `include`: all criteria met;
-- `exclude`: a criterion is not met;
+- `exclude`: a criterion is not met, or C1 or C2 cannot be judged from this paper (it does not describe the method well enough to extract it);
 - `pending`: C1 and C2 are met, but the evidence for C3 has to come from another publication. The method is then decided across all papers about it, or by the team.
+
+`evaluate.py` derives this reference decision from the C1–C3 judgements by these rules (`reference_decision`), so it is applied the same way to every method; the typed decision is only used for rows without criteria, such as `(no method found)`. Those rows are reported per paper, not counted as methods.
 
 If the paper describes a method that isn't listed, add a row at the bottom with the paper, the method and your decision; with `include` it counts as missed by the LLM. Then open **Compare** for the LLM's decision and its judgement and reason per criterion. Rebuilding a run keeps the screening judgements.
 
 The screening check only covers methods the LLM found, plus any a reviewer happens to add: it does not measure how many methods the LLM missed.
 
-When all papers of a run are reviewed, add them up (with 95% confidence intervals):
+When all papers of a run are reviewed, add them up:
 
 ```bash
-python evaluate.py runs/<date_time>                    # one run
-python evaluate.py runs/<baseline> runs/<improved>     # compare two runs
+python evaluate.py runs/<date_time> --complete-only                    # one run
+python evaluate.py runs/<round1> runs/<round2> --complete-only         # compare two rounds
+python evaluate.py ... --weighted                                      # also weighted estimates (see below)
 ```
 
-Besides the printed scores, it writes three files to the run folder: `results.tex` (the numbers as LaTeX commands for the paper), `review_overview.md` (raw counts per paper and per relation, the screening decisions and all reviewer notes, for finding error patterns) and `scores.json`. It reports four measures, each in its own unit:
+Besides the printed scores, it writes three files to each run folder: `results.tex` (the numbers as LaTeX commands for the paper), `review_overview.md` (raw counts per paper and per relation, the screening decisions and all reviewer notes, for finding error patterns) and `scores.json`. In `results.tex`, every measure is a percentage plus its counts: `\ResPrecision{} (\ResPrecisionN{})` gives "54% (89/166)". With two runs the macros are `\ResOne...` and `\ResTwo...`, so the paper can `\input` both files, and the second run's file also holds `\ResComparisonTable`. `--complete-only` leaves out papers whose review is not finished. It reports these measures, each in its own unit:
 
 - **exactly the same relations**, per quote;
 - **relation precision**, per (quote, relation) pair the LLM gave: how many you also gave (catches over-extraction);
@@ -76,7 +82,9 @@ Besides the printed scores, it writes three files to the run folder: `results.te
 
 Pairs are not claims: one pair can hold several claims (three activities named in one quote), so none of the measures is "per claim".
 
-The headline numbers are **estimates for all extracted quotes** of the reviewed papers. The sample is stratified (spread over (method, relation) groups, so rare relations are over-represented), so each sampled quote is weighted by the number of extracted quotes it stands for (inverse inclusion probability, reconstructed from `claims.jsonl` and the run's seed). Groups with no sampled quote are covered by scaling the paper's weights to its total; a warning shows how many quotes that concerns. The 95% intervals come from a bootstrap that resamples quotes within each paper. The unweighted numbers of the sample itself are printed too. All measures are also reported **corrected** with `llm_only_correct`: relations the LLM found and the reviewer first missed then count as right. The blind numbers are the strict ones; the corrected numbers account for reviewer misses, but were decided after seeing the LLM's answer, so report both.
+It also reports how many quotes **support nothing** for the method, and how many **LLM-only relations** the reviewer accepted after comparison. Exact agreement, precision and recall are also reported **corrected** with `llm_only_correct`: relations the LLM found and the reviewer first missed then count as right. The blind numbers are the strict ones; the corrected numbers account for reviewer misses, but were decided after seeing the LLM's answer, so report both.
+
+The numbers **describe the reviewed sample** (sums over the reviewed quotes, with their counts). The sample is stratified: spread over (method, relation) groups, so rare relations are over-represented and the sample is not proportional to all extracted quotes. With `--weighted`, `evaluate.py` additionally estimates the results for all extracted quotes: each sampled quote is weighted by the number of extracted quotes it stands for (inverse inclusion probability, reconstructed from `claims.jsonl` and the run's seed; groups with no sampled quote are covered by scaling the paper's weights to its total), with 95% intervals from a bootstrap that resamples quotes within each paper. These estimates (`\ResWeighted...`) were not used for the paper, because the validity of the weighting for this design was not confirmed.
 
 ## Changing things
 
